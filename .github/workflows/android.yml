@@ -40,6 +40,10 @@ jobs:
     name: APK
     runs-on: ubuntu-latest
     needs: core
+    # Necessaire pour attacher l'APK a une release : le jeton par defaut est en
+    # lecture seule et l'envoi d'asset repond alors 403.
+    permissions:
+      contents: write
     env:
       KEYSTORE_B64: ${{ secrets.TIMEWRAP_KEYSTORE_BASE64 }}
     steps:

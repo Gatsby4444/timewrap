@@ -1,76 +1,160 @@
 //! Cœur métier de Timewrap.
 //!
-//! Tout ce qui est risqué et testable vit ici : parsing iCalendar, expansion des
-//! récurrences, arithmétique de fuseaux, stockage. L'UI Android (Kotlin/Compose)
-//! consomme ce module via les bindings UniFFI.
-//!
-//! Phase 0 : la crate n'expose qu'un auto-diagnostic. Son rôle est de prouver que
-//! l'intégralité de la pile native (SQLite compilé en C, chrono-tz, icalendar,
-//! rrule) se compile pour Android et s'exécute réellement sur l'appareil.
+//! Tout ce qui est risqué et testable vit ici : lecture iCalendar, expansion des
+//! récurrences, arithmétique de fuseaux, stockage. L'interface Android
+//! (Kotlin/Compose) consomme ce module via les bindings générés par UniFFI, et
+//! une future application iOS réutilisera le même code via les bindings Swift.
 
 uniffi::setup_scaffolding!();
 
-use std::str::FromStr;
+mod error;
+mod ics;
+mod model;
+mod store;
+
+#[cfg(test)]
+mod tests;
+
+pub use error::TimewrapError;
+pub use model::{Calendar, CalendarKind, DayAgenda, ImportReport, NowView, Occurrence};
+
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use chrono_tz::Europe::Paris;
-use icalendar::{Calendar, CalendarComponent, Component, EventLike};
-use rrule::RRuleSet;
 
-/// Un `.ics` minimal mais représentatif d'un export d'ENT : fuseau nommé,
-/// récurrence hebdomadaire, salle en `LOCATION`.
-const SAMPLE_ICS: &str = concat!(
-    "BEGIN:VCALENDAR\r\n",
-    "VERSION:2.0\r\n",
-    "PRODID:-//Timewrap//Auto-diagnostic//FR\r\n",
-    "BEGIN:VEVENT\r\n",
-    "UID:selftest-1@timewrap\r\n",
-    "DTSTAMP:20260901T080000Z\r\n",
-    "DTSTART;TZID=Europe/Paris:20260907T080000\r\n",
-    "DTEND;TZID=Europe/Paris:20260907T100000\r\n",
-    "SUMMARY:Cours de test\r\n",
-    "LOCATION:Salle B204\r\n",
-    "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=5\r\n",
-    "END:VEVENT\r\n",
-    "END:VCALENDAR\r\n",
-);
+use error::Result;
+use store::Store;
 
-const SAMPLE_RRULE: &str =
-    "DTSTART;TZID=Europe/Paris:20260907T080000\nRRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=5";
+/// Point d'entrée unique du cœur : une base ouverte, un fuseau d'affichage.
+#[derive(uniffi::Object)]
+pub struct Timewrap {
+    store: Mutex<Store>,
+}
 
-/// Résultat de l'auto-diagnostic, affiché tel quel par l'application.
+#[uniffi::export]
+impl Timewrap {
+    /// Ouvre — ou crée — la base à `db_path`.
+    ///
+    /// `display_timezone` est un identifiant IANA (« Europe/Paris »). Il décide
+    /// du découpage en journées, donc de ce qu'affiche la vue Jour.
+    #[uniffi::constructor]
+    pub fn open(db_path: String, display_timezone: String) -> Result<Arc<Self>> {
+        let store = Store::open(&db_path, &display_timezone)?;
+        Ok(Arc::new(Timewrap {
+            store: Mutex::new(store),
+        }))
+    }
+
+    pub fn set_display_timezone(&self, timezone: String) -> Result<()> {
+        self.store()?.set_display_timezone(&timezone)
+    }
+
+    pub fn display_timezone(&self) -> Result<String> {
+        Ok(self.store()?.display_timezone().name().to_string())
+    }
+
+    // ---------------------------------------------------------------- agendas
+
+    pub fn calendars(&self) -> Result<Vec<Calendar>> {
+        self.store()?.calendars()
+    }
+
+    /// Importe un flux `.ics` dans un nouvel agenda.
+    ///
+    /// `source` garde la trace de l'origine — chemin du fichier ou URL
+    /// d'abonnement — pour pouvoir resynchroniser plus tard.
+    pub fn import_ics(
+        &self,
+        name: String,
+        kind: CalendarKind,
+        source: String,
+        ics_text: String,
+    ) -> Result<ImportReport> {
+        self.store()?
+            .import_ics(&name, kind, &source, &ics_text, now())
+    }
+
+    /// Remplace le contenu d'un agenda par une version plus récente du flux.
+    pub fn reimport_ics(&self, calendar_id: String, ics_text: String) -> Result<ImportReport> {
+        self.store()?.reimport_ics(&calendar_id, &ics_text, now())
+    }
+
+    pub fn set_calendar_visible(&self, calendar_id: String, visible: bool) -> Result<()> {
+        self.store()?.set_visible(&calendar_id, visible)
+    }
+
+    pub fn set_calendar_color(&self, calendar_id: String, color: u32) -> Result<()> {
+        self.store()?.set_color(&calendar_id, color)
+    }
+
+    pub fn rename_calendar(&self, calendar_id: String, name: String) -> Result<()> {
+        self.store()?.rename_calendar(&calendar_id, &name)
+    }
+
+    pub fn delete_calendar(&self, calendar_id: String) -> Result<()> {
+        self.store()?.delete_calendar(&calendar_id)
+    }
+
+    // --------------------------------------------------------------- requêtes
+
+    /// Occurrences chevauchant l'intervalle, en secondes Unix.
+    pub fn occurrences_between(&self, from_utc: i64, to_utc: i64) -> Result<Vec<Occurrence>> {
+        self.store()?.occurrences_between(from_utc, to_utc)
+    }
+
+    /// Une journée, `epoch_day` étant compté comme `LocalDate.toEpochDay()`.
+    pub fn day(&self, epoch_day: i64) -> Result<DayAgenda> {
+        self.store()?.day(epoch_day)
+    }
+
+    /// `days` journées consécutives — la vue Semaine en demande sept.
+    pub fn days(&self, epoch_day: i64, days: u32) -> Result<Vec<DayAgenda>> {
+        self.store()?.days(epoch_day, days)
+    }
+
+    /// Où j'en suis maintenant, et ce qui vient après.
+    pub fn now_view(&self) -> Result<NowView> {
+        self.store()?.now_view(now())
+    }
+
+    /// Re-développe les récurrences si l'horizon devient trop proche.
+    /// À appeler au démarrage ; ne fait rien la plupart du temps.
+    pub fn ensure_horizon(&self) -> Result<bool> {
+        self.store()?.ensure_horizon(now())
+    }
+
+    // ------------------------------------------------------------ diagnostics
+
+    /// Vérifie que chaque dépendance native répond, sur l'appareil.
+    pub fn self_test(&self) -> Result<SelfTest> {
+        let store = self.store()?;
+        let now = now();
+        Ok(SelfTest {
+            core_version: core_version(),
+            display_timezone: store.display_timezone().name().to_string(),
+            calendars: store.calendars()?.len() as u32,
+            occurrences: store.occurrences_between(now - 86_400, now + 86_400)?.len() as u32,
+        })
+    }
+}
+
+// Hors du bloc exporté : UniFFI publierait sinon ces aides internes, dont le
+// type de retour n'a aucun équivalent de l'autre côté de la frontière.
+impl Timewrap {
+    fn store(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
+        self.store
+            .lock()
+            .map_err(|_| TimewrapError::Database("verrou de base empoisonné".into()))
+    }
+}
+
+/// État interne, affiché par l'écran de diagnostic.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SelfTest {
     pub core_version: String,
-    pub now_utc: String,
-    pub now_paris: String,
-    pub sqlite_version: String,
-    pub ics_event_count: u32,
-    pub ics_first_summary: String,
-    pub ics_first_location: String,
-    pub rrule_occurrence_count: u32,
-    pub rrule_first: String,
-    pub rrule_last: String,
-    /// Vide si tout va bien ; sinon une ligne lisible par sous-système en échec.
-    pub failures: Vec<String>,
-}
-
-impl SelfTest {
-    fn empty() -> Self {
-        Self {
-            core_version: core_version(),
-            now_utc: String::new(),
-            now_paris: String::new(),
-            sqlite_version: String::new(),
-            ics_event_count: 0,
-            ics_first_summary: String::new(),
-            ics_first_location: String::new(),
-            rrule_occurrence_count: 0,
-            rrule_first: String::new(),
-            rrule_last: String::new(),
-            failures: Vec::new(),
-        }
-    }
+    pub display_timezone: String,
+    pub calendars: u32,
+    pub occurrences: u32,
 }
 
 /// Version de la crate, telle que déclarée dans `Cargo.toml`.
@@ -79,93 +163,6 @@ pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Exerce chaque dépendance native et rend compte, sans jamais paniquer.
-#[uniffi::export]
-pub fn self_test() -> SelfTest {
-    let mut out = SelfTest::empty();
-
-    // Horloge et base de fuseaux (chrono + chrono-tz).
-    let now = Utc::now();
-    out.now_utc = now.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-    out.now_paris = now
-        .with_timezone(&Paris)
-        .format("%Y-%m-%d %H:%M:%S %Z")
-        .to_string();
-
-    // SQLite compilé depuis les sources C par le NDK.
-    match sqlite_version() {
-        Ok(v) => out.sqlite_version = v,
-        Err(e) => out.failures.push(format!("sqlite: {e}")),
-    }
-
-    // Parsing iCalendar.
-    match SAMPLE_ICS.parse::<Calendar>() {
-        Ok(cal) => {
-            let events: Vec<_> = cal
-                .components
-                .iter()
-                .filter_map(|c| match c {
-                    CalendarComponent::Event(e) => Some(e),
-                    _ => None,
-                })
-                .collect();
-            out.ics_event_count = events.len() as u32;
-            if let Some(first) = events.first() {
-                out.ics_first_summary = first.get_summary().unwrap_or_default().to_string();
-                out.ics_first_location = first.get_location().unwrap_or_default().to_string();
-            } else {
-                out.failures.push("ics: aucun VEVENT trouvé".to_string());
-            }
-        }
-        Err(e) => out.failures.push(format!("ics: {e}")),
-    }
-
-    // Expansion de récurrence.
-    match RRuleSet::from_str(SAMPLE_RRULE) {
-        Ok(set) => {
-            let dates = set.all(50).dates;
-            out.rrule_occurrence_count = dates.len() as u32;
-            if let Some(d) = dates.first() {
-                out.rrule_first = d.format("%Y-%m-%d %H:%M %Z").to_string();
-            }
-            if let Some(d) = dates.last() {
-                out.rrule_last = d.format("%Y-%m-%d %H:%M %Z").to_string();
-            }
-            if dates.len() != 5 {
-                out.failures.push(format!(
-                    "rrule: 5 occurrences attendues, {} obtenues",
-                    dates.len()
-                ));
-            }
-        }
-        Err(e) => out.failures.push(format!("rrule: {e}")),
-    }
-
-    out
-}
-
-fn sqlite_version() -> Result<String, rusqlite::Error> {
-    let conn = rusqlite::Connection::open_in_memory()?;
-    conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn self_test_passe_sur_lhote() {
-        let r = self_test();
-        assert!(r.failures.is_empty(), "échecs : {:?}", r.failures);
-        assert_eq!(r.ics_event_count, 1);
-        assert_eq!(r.ics_first_summary, "Cours de test");
-        assert_eq!(r.ics_first_location, "Salle B204");
-        assert_eq!(r.rrule_occurrence_count, 5);
-        assert!(!r.sqlite_version.is_empty());
-    }
-
-    #[test]
-    fn version_non_vide() {
-        assert!(!core_version().is_empty());
-    }
+fn now() -> i64 {
+    Utc::now().timestamp()
 }

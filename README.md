@@ -7,8 +7,9 @@ quoi après ?*
 Elle lit les exports **iCalendar** d'un ENT — fichier `.ics` ou URL d'abonnement — et les
 restitue dans une interface mobile, hors-ligne, sans compte ni serveur.
 
-> État : **phase 0**. Le squelette et la chaîne de compilation sont en place ; l'application
-> n'affiche pour l'instant qu'un auto-diagnostic de sa pile native. Voir la feuille de route.
+> État : **phase 1**. L'application lit un export `.ics`, le stocke hors ligne et l'affiche dans
+> trois vues — Maintenant, Jour, Semaine. La synchronisation automatique et les rappels arrivent
+> ensuite. Voir la feuille de route.
 
 ## Architecture
 
@@ -95,7 +96,7 @@ entrer : les fixtures de `core/tests/fixtures/` sont anonymisées.
 | Phase | Contenu |
 |---|---|
 | **0** ✅ | Squelette, chaîne Rust → NDK → APK signé, CI, auto-diagnostic embarqué |
-| **1** | Parsing iCalendar, stockage, import de fichier, vues Maintenant / Jour / Semaine |
+| **1** ✅ | Lecture iCalendar, stockage, import de fichier, vues Maintenant / Jour / Semaine |
 | **2** | Abonnement par URL, synchronisation automatique, notifications de changement, rappels |
 | **3** | Renommage, couleurs et masquage des cours, avec suggestions automatiques |
 | **4** | Agendas locaux éditables, vues Cours / Perso / Projets, notes et devoirs |

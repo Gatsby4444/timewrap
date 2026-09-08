@@ -8,3 +8,6 @@ gradlew      text eol=lf
 *.keystore   binary
 *.png        binary
 *.apk        binary
+
+# Les fixtures iCalendar gardent leurs octets exacts (fins de ligne comprises).
+core/tests/fixtures/*.ics -text

@@ -406,9 +406,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fda1b791865374063fa57e84adfe3823c2d5cd5968d721533be4556a24cffd8"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "iso8601",
  "nom 8.0.0",
  "nom-language",
+ "rrule",
+ "thiserror",
  "uuid",
 ]
 
@@ -894,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "timewrap-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "chrono-tz",
