@@ -1,0 +1,25 @@
+[package]
+name = "timewrap-core"
+description = "Cœur métier de Timewrap : parsing iCalendar, récurrences, stockage, règles."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "timewrap_core"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10.4"
+rrule = "0.14"
+icalendar = "0.17"
+rusqlite = { version = "0.40", features = ["bundled"] }
+regex = "1.13"
+thiserror = "2.0"

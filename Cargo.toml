@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Gatsby4444/timewrap"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# Ni `strip`, ni `panic = "abort"` : UniFFI a besoin des symboles de métadonnées
+# pour générer les bindings, et de pouvoir rattraper un panic à la frontière FFI.

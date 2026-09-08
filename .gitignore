@@ -1,0 +1,29 @@
+# --- Données personnelles : ne JAMAIS commiter (dépôt public) ---
+samples/local/
+*.ics
+!core/tests/fixtures/*.ics
+keystore/
+keystore.properties
+*.jks
+*.keystore
+
+# --- Rust ---
+/target/
+**/target/
+
+# --- Android / Gradle ---
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
+android/captures/
+android/.cxx/
+*.apk
+*.aab
+*.iml
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

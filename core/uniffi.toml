@@ -1,0 +1,3 @@
+[bindings.kotlin]
+package_name = "app.timewrap.core"
+cdylib_name = "timewrap_core"
