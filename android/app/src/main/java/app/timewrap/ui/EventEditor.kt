@@ -50,7 +50,6 @@ import androidx.compose.ui.unit.dp
 import app.timewrap.UiState
 import app.timewrap.core.Category
 import app.timewrap.core.Conflict
-import app.timewrap.core.ConflictScope
 import app.timewrap.core.EventDraft
 import app.timewrap.core.Occurrence
 import java.time.LocalDate
@@ -66,7 +65,7 @@ private const val DEFAULT_MINUTES = 60L
  * L'heure de départ est arrondie à l'heure suivante : on crée presque toujours
  * un créneau pour « tout à l'heure », rarement pour la minute exacte.
  */
-fun newDraft(calendarId: String, epochDay: Long): EventDraft {
+fun newDraft(epochDay: Long): EventDraft {
     val date = LocalDate.ofEpochDay(epochDay)
     val now = LocalTime.now(deviceZone)
     val start = if (date == LocalDate.now(deviceZone)) {
@@ -76,7 +75,6 @@ fun newDraft(calendarId: String, epochDay: Long): EventDraft {
     }
     return EventDraft(
         id = null,
-        calendarId = calendarId,
         title = "",
         location = "",
         description = "",
@@ -120,7 +118,7 @@ fun EventEditor(
     val start = draft.startUtc.toLocalDateTime()
     val end = draft.endUtc.toLocalDateTime()
 
-    LaunchedEffect(draft.startUtc, draft.endUtc, draft.calendarId, draft.id) {
+    LaunchedEffect(draft.startUtc, draft.endUtc, draft.id) {
         onCheck(draft)
     }
 
@@ -141,7 +139,7 @@ fun EventEditor(
                     }
                     TextButton(
                         onClick = { onSave(draft) },
-                        enabled = draft.endUtc > draft.startUtc && draft.calendarId.isNotBlank(),
+                        enabled = draft.endUtc > draft.startUtc,
                     ) { Text("Enregistrer") }
                 },
             )
@@ -162,22 +160,6 @@ fun EventEditor(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-
-            SectionLabel("Agenda")
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                state.calendars.forEach { calendar ->
-                    FilterChip(
-                        selected = draft.calendarId == calendar.id,
-                        onClick = { draft = draft.copy(calendarId = calendar.id) },
-                        label = { Text(calendar.name, maxLines = 1) },
-                    )
-                }
-            }
 
             SectionLabel("Quand")
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -374,32 +356,6 @@ private fun FieldButton(label: String, value: String, onClick: () -> Unit) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun TimePickerDialog(
-    title: String,
-    initial: LocalTime,
-    onDismiss: () -> Unit,
-    onConfirm: (LocalTime) -> Unit,
-) {
-    val state = rememberTimePickerState(
-        initialHour = initial.hour,
-        initialMinute = initial.minute,
-        is24Hour = true,
-    )
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = { TimePicker(state = state) },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(LocalTime.of(state.hour, state.minute)) }) {
-                Text("Choisir")
-            }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } },
-    )
-}
-
 @Composable
 fun CategoryPicker(
     categories: List<Category>,
@@ -493,14 +449,6 @@ fun ConflictLine(conflict: Conflict) {
             text = buildString {
                 append(other.timeRange())
                 append(" · ")
-                append(other.calendarName)
-                append(" · ")
-                append(
-                    when (conflict.scope) {
-                        ConflictScope.SAME_CALENDAR -> "même agenda"
-                        ConflictScope.CROSS_CALENDAR -> "autre agenda"
-                    },
-                )
                 append(" · ")
                 append("${conflict.overlapMinutes} min en commun")
             },
@@ -518,7 +466,6 @@ fun ConflictLine(conflict: Conflict) {
  */
 fun draftOf(occurrence: Occurrence): EventDraft = EventDraft(
     id = occurrence.id,
-    calendarId = occurrence.calendarId,
     title = occurrence.rawTitle,
     location = occurrence.location,
     description = occurrence.description,

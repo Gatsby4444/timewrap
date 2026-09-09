@@ -556,7 +556,7 @@ private fun matchChip(draft: Rule, value: RuleMatch, label: String, onPick: (Rul
 private fun emptyRule() = Rule(
     id = "",
     name = "",
-    calendarId = null,
+    property = null,
     field = RuleField.TITLE,
     matchKind = RuleMatch.WORD,
     pattern = "",
@@ -576,6 +576,9 @@ private fun describe(rule: Rule): String {
         RuleField.LOCATION -> "Lieu"
         RuleField.DESCRIPTION -> "Notes"
         RuleField.ANY -> "Partout"
+        // Les règles de champ viennent de l'écran des couleurs : on nomme le
+        // champ visé plutôt que d'afficher « Property », qui ne dirait rien.
+        RuleField.PROPERTY -> rule.property?.replaceFirstChar { it.uppercase() } ?: "Champ"
     }
     val match = when (rule.matchKind) {
         RuleMatch.CONTAINS -> "contient"

@@ -1,15 +1,15 @@
 //! Le moteur de chevauchements.
 //!
-//! Un emploi du temps qui mêle plusieurs agendas finit toujours par se
-//! contredire : un rendez-vous personnel posé sur un TP, deux créneaux importés
-//! qui se recouvrent après un changement de salle. Le cœur ne tranche jamais
-//! seul — il constate, chiffre le recouvrement, et propose. La décision reste à
-//! l'utilisateur, et c'est `Resolution` qui la transporte.
+//! Un emploi du temps finit toujours par se contredire : un rendez-vous posé
+//! sur un TP, deux créneaux importés qui se recouvrent après un changement de
+//! salle. Le cœur ne tranche jamais seul — il constate, chiffre le
+//! recouvrement, et propose. La décision reste à l'utilisateur, et c'est
+//! `Resolution` qui la transporte.
 //!
 //! Comme le moteur de règles, ce module ne connaît pas la base : il raisonne
 //! sur des occurrences déjà chargées.
 
-use crate::model::{Conflict, ConflictPair, ConflictScope, EventOrigin, Occurrence};
+use crate::model::{Conflict, ConflictPair, EventOrigin, Occurrence};
 
 /// Recouvrement de deux intervalles, en secondes. Nul si les créneaux se
 /// touchent sans se chevaucher — finir à 10:00 et commencer à 10:00 n'est pas
@@ -25,7 +25,6 @@ pub fn overlap_seconds(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> i6
 /// quoi tout déplacement se heurterait à sa propre version précédente.
 pub fn against_draft(
     draft_id: Option<&str>,
-    draft_calendar: &str,
     start_utc: i64,
     end_utc: i64,
     candidates: &[Occurrence],
@@ -40,7 +39,6 @@ pub fn against_draft(
                 return None;
             }
             Some(Conflict {
-                scope: scope_of(draft_calendar, &other.calendar_id),
                 overlap_minutes: (overlap / 60).max(1),
                 other_deletable: other.origin == EventOrigin::Local,
                 other: other.clone(),
@@ -48,13 +46,7 @@ pub fn against_draft(
         })
         .collect();
 
-    // Le même agenda d'abord : c'est le heurt le plus gênant, celui qu'on veut
-    // lire en premier dans la boîte de dialogue.
-    conflicts.sort_by(|a, b| {
-        a.scope
-            .cmp_priority(b.scope)
-            .then(a.other.start_utc.cmp(&b.other.start_utc))
-    });
+    conflicts.sort_by_key(|c| c.other.start_utc);
     conflicts
 }
 
@@ -86,7 +78,6 @@ pub fn pairs(occurrences: &[Occurrence]) -> Vec<ConflictPair> {
                 continue;
             }
             out.push(ConflictPair {
-                scope: scope_of(&first.calendar_id, &second.calendar_id),
                 first: (*first).clone(),
                 second: (*second).clone(),
                 overlap_minutes: (overlap / 60).max(1),
@@ -100,24 +91,4 @@ pub fn pairs(occurrences: &[Occurrence]) -> Vec<ConflictPair> {
 /// conflits, sa durée conservée.
 pub fn shift_after(conflicts: &[Conflict]) -> Option<i64> {
     conflicts.iter().map(|c| c.other.end_utc).max()
-}
-
-fn scope_of(a: &str, b: &str) -> ConflictScope {
-    if a == b {
-        ConflictScope::SameCalendar
-    } else {
-        ConflictScope::CrossCalendar
-    }
-}
-
-impl ConflictScope {
-    fn cmp_priority(self, other: Self) -> std::cmp::Ordering {
-        fn rank(scope: ConflictScope) -> u8 {
-            match scope {
-                ConflictScope::SameCalendar => 0,
-                ConflictScope::CrossCalendar => 1,
-            }
-        }
-        rank(self).cmp(&rank(other))
-    }
 }

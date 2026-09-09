@@ -49,8 +49,9 @@ fun NowScreen(
     state: UiState,
     onImport: () -> Unit,
     onSelect: (Occurrence) -> Unit,
+    onOpenTasks: () -> Unit = {},
 ) {
-    if (state.calendars.isEmpty()) {
+    if (!state.hasTimetable) {
         EmptyState(onImport)
         return
     }
@@ -69,6 +70,8 @@ fun NowScreen(
                 fontWeight = FontWeight.Bold,
             )
         }
+
+        item { TaskSummaryCard(state, onOpenTasks) }
 
         val current = now?.current
         val next = now?.next
@@ -103,7 +106,7 @@ fun NowScreen(
         if (current == null && next == null) {
             item {
                 Text(
-                    text = "Plus rien de prévu dans les agendas importés.",
+                    text = "Plus rien de prévu dans l'emploi du temps.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
                 )

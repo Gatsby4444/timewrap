@@ -13,7 +13,7 @@ EXDATE;TZID=Europe/Paris:20261012T080000
 SUMMARY:R3.01 DEV WEB - CM (Gr A)
 LOCATION:AMPHI B - Batiment Sciences
 DESCRIPTION:Intervenant : MARTIN Camille\nGroupe : INFO-S3-A\nType : Cours magis
- tral\nSalle : AMPHI B
+ tral\nMatière : Developpement web\nSalle : AMPHI B
 X-ADE-COURSE-CODE:R3.01
 END:VEVENT
 BEGIN:VEVENT
@@ -34,7 +34,8 @@ DTEND;TZID=Europe/Paris:20260908T163000
 RRULE:FREQ=WEEKLY;BYDAY=TU;UNTIL=20261215T235959Z
 SUMMARY:R3.04 BDD - TP (Gr A2)
 LOCATION:SALLE INFO 12
-DESCRIPTION:Intervenant : DUBOIS Alex\nGroupe : INFO-S3-A2
+DESCRIPTION:Intervenant : DUBOIS Alex\nGroupe : INFO-S3-A2\nType : Travaux prat
+ iques\nMatière : Bases de donnees
 END:VEVENT
 BEGIN:VEVENT
 UID:ADE-0003@fixture.timewrap

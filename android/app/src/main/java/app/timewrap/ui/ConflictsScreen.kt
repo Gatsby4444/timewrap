@@ -40,7 +40,6 @@ import androidx.compose.ui.unit.dp
 import app.timewrap.PendingSave
 import app.timewrap.UiState
 import app.timewrap.core.ConflictPair
-import app.timewrap.core.ConflictScope
 import app.timewrap.core.EventOrigin
 import app.timewrap.core.Occurrence
 import app.timewrap.core.Resolution
@@ -63,7 +62,7 @@ fun ConflictsScreen(
     onEdit: (Occurrence) -> Unit,
     onBack: () -> Unit,
 ) {
-    LaunchedEffect(state.scope) { onLoad() }
+    LaunchedEffect(Unit) { onLoad() }
 
     Scaffold(
         topBar = {
@@ -86,8 +85,7 @@ fun ConflictsScreen(
         ) {
             item {
                 Text(
-                    text = state.openCalendar?.let { "Dans « ${it.name} », sur les deux mois qui viennent." }
-                        ?: "Tous agendas confondus, sur les deux mois qui viennent.",
+                    text = "Sur les deux mois qui viennent.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                 )
@@ -149,7 +147,7 @@ private fun MutedCard(occurrence: Occurrence, onUnmute: () -> Unit) {
                 )
                 Text(
                     text = "${occurrence.startUtc.toLocalDate().shortLabel()} · " +
-                        "${occurrence.timeRange()} · ${occurrence.calendarName}",
+                        occurrence.timeRange(),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                 )
@@ -175,15 +173,6 @@ private fun ConflictCard(
                 color = MaterialTheme.colorScheme.error,
                 fontWeight = FontWeight.SemiBold,
             )
-            Text(
-                text = when (pair.scope) {
-                    ConflictScope.SAME_CALENDAR -> "Deux créneaux du même agenda"
-                    ConflictScope.CROSS_CALENDAR -> "Deux agendas différents"
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-            )
-
             Spacer(Modifier.height(12.dp))
             ConflictSide(pair.first, onMute, onDelete, onEdit)
             HorizontalDivider(Modifier.padding(vertical = 10.dp))
@@ -219,7 +208,7 @@ private fun ConflictSide(
             }
         }
         Text(
-            text = "${occurrence.timeRange()} · ${occurrence.calendarName}",
+            text = occurrence.timeRange(),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
         )
@@ -266,7 +255,7 @@ fun ConflictResolutionDialog(
                             fontWeight = FontWeight.Medium,
                         )
                         Text(
-                            text = "${conflict.other.timeRange()} · ${conflict.other.calendarName} · " +
+                            text = "${conflict.other.timeRange()} · " +
                                 "${conflict.overlapMinutes} min en commun",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),

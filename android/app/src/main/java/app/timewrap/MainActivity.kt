@@ -10,7 +10,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,16 +18,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.List
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.DateRange
 import androidx.compose.material.icons.outlined.Home
-import androidx.compose.material.icons.outlined.Menu
-import androidx.compose.material3.AssistChip
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -52,7 +49,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
@@ -61,16 +57,23 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import app.timewrap.core.EventDraft
 import app.timewrap.core.EventOrigin
 import app.timewrap.core.Occurrence
+import app.timewrap.core.PropertyKey
+import app.timewrap.core.Task
+import app.timewrap.notify.Notifications
 import app.timewrap.ui.CategoryChip
 import app.timewrap.ui.CategoryPicker
+import app.timewrap.ui.ColorsScreen
 import app.timewrap.ui.ConflictResolutionDialog
 import app.timewrap.ui.ConflictsScreen
 import app.timewrap.ui.DayScreen
 import app.timewrap.ui.EventEditor
-import app.timewrap.ui.HomeScreen
 import app.timewrap.ui.NowScreen
+import app.timewrap.ui.PropertyValuesScreen
 import app.timewrap.ui.RulesScreen
 import app.timewrap.ui.SectionLabel
+import app.timewrap.ui.SettingsScreen
+import app.timewrap.ui.TaskEditorDialog
+import app.timewrap.ui.TasksScreen
 import app.timewrap.ui.WeekScreen
 import app.timewrap.ui.draftOf
 import app.timewrap.ui.longLabel
@@ -89,6 +92,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         pendingImport = intent.extractIcsUri()
+        Notifications.ensureChannels(this)
 
         val core = (application as TimewrapApp).core
 
@@ -98,7 +102,8 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background,
                 ) {
-                    val model: AppViewModel = viewModel(factory = AppViewModel.Factory(core))
+                    val model: AppViewModel =
+                        viewModel(factory = AppViewModel.Factory(core, this))
                     TimewrapRoot(
                         model = model,
                         pendingImport = pendingImport,
@@ -116,7 +121,7 @@ class MainActivity : ComponentActivity() {
         pendingImport = intent.extractIcsUri()
     }
 
-    /** Lit le contenu d'un `.ics` et devine un nom d'agenda présentable. */
+    /** Lit le contenu d'un `.ics` et devine un nom présentable. */
     private fun readIcs(uri: Uri): Pair<String, String>? = runCatching {
         val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
             ?: return null
@@ -137,21 +142,24 @@ private fun Intent.extractIcsUri(): Uri? = when (action) {
 }
 
 private enum class Tab(val label: String, val icon: ImageVector) {
-    Home("Agendas", Icons.Outlined.Menu),
     Now("Maintenant", Icons.Outlined.Home),
     Day("Jour", Icons.AutoMirrored.Outlined.List),
     Week("Semaine", Icons.Outlined.DateRange),
+    Tasks("À faire", Icons.Outlined.Check),
+    Settings("Réglages", Icons.Outlined.Settings),
 }
 
 /**
- * Ce qui se superpose aux vues : les deux gestionnaires et l'éditeur.
+ * Ce qui se superpose aux vues.
  *
  * Un écran plein plutôt qu'une destination de navigation, parce qu'il n'y a
- * jamais qu'un seul niveau : on ouvre, on agit, on revient.
+ * jamais qu'un ou deux niveaux : on ouvre, on agit, on revient.
  */
 private sealed interface Overlay {
     data object Conflicts : Overlay
     data object Rules : Overlay
+    data object Colors : Overlay
+    data class PropertyValues(val key: PropertyKey) : Overlay
     data class Editor(val draft: EventDraft) : Overlay
 }
 
@@ -165,9 +173,10 @@ private fun TimewrapRoot(
 ) {
     val state by model.state.collectAsState()
     val liveConflicts by model.draftConflicts.collectAsState()
-    var tab by remember { mutableStateOf(Tab.Home) }
+    var tab by remember { mutableStateOf(Tab.Now) }
     var overlay by remember { mutableStateOf<Overlay?>(null) }
     var detail by remember { mutableStateOf<Occurrence?>(null) }
+    var editingTask by remember { mutableStateOf<Task?>(null) }
     val snackbar = remember { SnackbarHostState() }
 
     val picker = rememberLauncherForActivityResult(
@@ -208,20 +217,23 @@ private fun TimewrapRoot(
         }
     }
 
-    BackHandler(enabled = overlay != null || tab != Tab.Home) {
-        if (overlay != null) overlay = null else tab = Tab.Home
+    BackHandler(enabled = overlay != null || tab != Tab.Now) {
+        when {
+            overlay is Overlay.PropertyValues -> overlay = Overlay.Colors
+            overlay != null -> overlay = null
+            else -> tab = Tab.Now
+        }
     }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
-            val target = state.defaultTarget
-            if (tab != Tab.Home && target != null) {
-                FloatingActionButton(
-                    onClick = {
-                        overlay = Overlay.Editor(newDraft(target.id, state.selectedDay))
-                    },
-                ) { Icon(Icons.Outlined.Add, contentDescription = "Nouvel événement") }
+            if (tab == Tab.Day || tab == Tab.Week) {
+                if (state.hasTimetable) {
+                    FloatingActionButton(
+                        onClick = { overlay = Overlay.Editor(newDraft(state.selectedDay)) },
+                    ) { Icon(Icons.Outlined.Add, contentDescription = "Nouvel événement") }
+                }
             }
         },
         bottomBar = {
@@ -237,57 +249,83 @@ private fun TimewrapRoot(
             }
         },
     ) { padding ->
-        Column(
+        Box(
             Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            if (tab != Tab.Home) {
-                ScopeBanner(state, onClear = { model.openCalendar(null) })
-            }
-            Box(Modifier.fillMaxSize()) {
-                when (tab) {
-                    Tab.Home -> HomeScreen(
-                        state = state,
-                        onOpen = { calendarId ->
-                            model.openCalendar(calendarId)
-                            tab = Tab.Now
-                        },
-                        onImport = { openPicker() },
-                        onCreate = model::createCalendar,
-                        onRename = model::rename,
-                        onColor = model::setCalendarColor,
-                        onToggle = model::setVisible,
-                        onMove = model::moveCalendar,
-                        onDelete = model::delete,
-                        onConflicts = { overlay = Overlay.Conflicts },
-                        onRules = { overlay = Overlay.Rules },
-                    )
+            when (tab) {
+                Tab.Now -> NowScreen(
+                    state = state,
+                    onImport = { tab = Tab.Settings },
+                    onSelect = { detail = it },
+                    onOpenTasks = { tab = Tab.Tasks },
+                )
 
-                    Tab.Now -> NowScreen(
-                        state,
-                        onImport = { tab = Tab.Home },
-                        onSelect = { detail = it },
-                    )
+                Tab.Day -> DayScreen(
+                    state,
+                    onSelectDay = model::selectDay,
+                    onSelect = { detail = it },
+                )
 
-                    Tab.Day -> DayScreen(
-                        state,
-                        onSelectDay = model::selectDay,
-                        onSelect = { detail = it },
-                    )
+                Tab.Week -> WeekScreen(
+                    state,
+                    onSelectWeek = model::selectWeek,
+                    onSelect = { detail = it },
+                )
 
-                    Tab.Week -> WeekScreen(
-                        state,
-                        onSelectWeek = model::selectWeek,
-                        onSelect = { detail = it },
-                    )
-                }
+                Tab.Tasks -> TasksScreen(
+                    state = state,
+                    onSelectDay = model::selectDay,
+                    onAdd = model::addTask,
+                    onToggle = model::setTaskDone,
+                    onPostpone = model::postponeTask,
+                    onEdit = { editingTask = it },
+                    onDelete = model::deleteTask,
+                )
+
+                Tab.Settings -> SettingsScreen(
+                    state = state,
+                    onImportFile = { openPicker() },
+                    onSubscribe = model::subscribe,
+                    onSyncNow = model::syncNow,
+                    onSettings = model::updateSettings,
+                    onRename = model::renameTimetable,
+                    onColor = model::setTimetableColor,
+                    onColors = { overlay = Overlay.Colors },
+                    onConflicts = { overlay = Overlay.Conflicts },
+                    onClear = model::clearTimetable,
+                )
             }
         }
     }
 
     when (val current = overlay) {
         null -> Unit
+
+        Overlay.Colors -> Surface(Modifier.fillMaxSize()) {
+            ColorsScreen(
+                state = state,
+                onLoad = model::loadColors,
+                onOpenKey = { overlay = Overlay.PropertyValues(it) },
+                onRules = { overlay = Overlay.Rules },
+                onBack = { overlay = null },
+            )
+        }
+
+        is Overlay.PropertyValues -> Surface(Modifier.fillMaxSize()) {
+            PropertyValuesScreen(
+                propertyKey = current.key,
+                values = state.propertyValues,
+                onLoad = { model.openProperty(current.key.key) },
+                onPick = { value, color ->
+                    model.setPropertyColor(current.key.key, value, color)
+                },
+                onClear = { value -> model.clearPropertyColor(current.key.key, value) },
+                onAutoColor = { model.autoColorProperty(current.key.key) },
+                onBack = { overlay = Overlay.Colors },
+            )
+        }
 
         Overlay.Conflicts -> Surface(Modifier.fillMaxSize()) {
             ConflictsScreen(
@@ -311,7 +349,7 @@ private fun TimewrapRoot(
                 onCreateCategory = model::createCategory,
                 onUpdateCategory = model::updateCategory,
                 onDeleteCategory = model::deleteCategory,
-                onBack = { overlay = null },
+                onBack = { overlay = Overlay.Colors },
             )
         }
 
@@ -347,6 +385,17 @@ private fun TimewrapRoot(
         )
     }
 
+    editingTask?.let { task ->
+        TaskEditorDialog(
+            task = task,
+            onDismiss = { editingTask = null },
+            onConfirm = { title, notes ->
+                model.updateTask(task.id, title, notes)
+                editingTask = null
+            },
+        )
+    }
+
     detail?.let { occurrence ->
         ModalBottomSheet(
             onDismissRequest = { detail = null },
@@ -366,33 +415,6 @@ private fun TimewrapRoot(
                 onCategory = { model.setOccurrenceCategory(occurrence.id, it) },
             )
         }
-    }
-}
-
-/** Le rappel discret de l'agenda ouvert, avec la sortie à portée de pouce. */
-@Composable
-private fun ScopeBanner(state: UiState, onClear: () -> Unit) {
-    val open = state.openCalendar ?: return
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        AssistChip(
-            onClick = onClear,
-            label = { Text(open.name) },
-            leadingIcon = {
-                Box(
-                    Modifier
-                        .size(10.dp)
-                        .clip(CircleShape)
-                        .background(Color(open.color.toInt())),
-                )
-            },
-        )
-        TextButton(onClick = onClear) { Text("Tout voir") }
     }
 }
 
@@ -452,10 +474,6 @@ private fun OccurrenceDetail(
             SectionLabel("Détails")
             Text(occurrence.description, style = MaterialTheme.typography.bodyMedium)
         }
-
-        Spacer(Modifier.height(16.dp))
-        SectionLabel("Agenda")
-        Text(occurrence.calendarName, style = MaterialTheme.typography.bodyMedium)
 
         if (occurrence.title != occurrence.rawTitle) {
             Spacer(Modifier.height(16.dp))

@@ -5,15 +5,13 @@
 //! frontière FFI. La conversion vers l'heure locale est faite par le cœur pour
 //! le regroupement par jour, et par l'interface pour l'affichage.
 
-/// D'où viennent les événements d'un agenda.
+/// D'où viennent les événements de l'emploi du temps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum CalendarKind {
     /// Fichier `.ics` importé une fois.
     IcsFile,
     /// URL d'abonnement, re-téléchargeable.
     IcsUrl,
-    /// Agenda local, édité dans l'application.
-    Local,
 }
 
 impl CalendarKind {
@@ -21,14 +19,12 @@ impl CalendarKind {
         match self {
             CalendarKind::IcsFile => "ics_file",
             CalendarKind::IcsUrl => "ics_url",
-            CalendarKind::Local => "local",
         }
     }
 
     pub(crate) fn from_str(s: &str) -> Self {
         match s {
             "ics_url" => CalendarKind::IcsUrl,
-            "local" => CalendarKind::Local,
             _ => CalendarKind::IcsFile,
         }
     }
@@ -36,12 +32,12 @@ impl CalendarKind {
 
 /// D'où vient une occurrence précise.
 ///
-/// La distinction compte au moment de résoudre un conflit : une séance locale
-/// se supprime, une séance importée ne peut être que masquée — le prochain
+/// La distinction compte au moment de résoudre un conflit : une séance saisie
+/// ici se supprime, une séance importée ne peut être que masquée — le prochain
 /// import la ferait revenir de toute façon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum EventOrigin {
-    /// Développée depuis un flux iCalendar.
+    /// Développée depuis le flux iCalendar.
     Ics,
     /// Saisie dans l'application.
     Local,
@@ -63,49 +59,81 @@ impl EventOrigin {
     }
 }
 
-/// Un agenda : un dossier d'événements, que l'on peut consulter seul ou mêlé
-/// aux autres.
+/// L'emploi du temps : sa source, sa dernière mise à jour, sa taille.
+///
+/// Il n'y en a qu'un. Réimporter un fichier ou resynchroniser une URL remplace
+/// son contenu sans changer son identité, ce qui laisse intactes les séances
+/// ajoutées à la main et les personnalisations.
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct Calendar {
+pub struct Timetable {
     pub id: String,
     pub name: String,
     pub kind: CalendarKind,
-    /// Chemin d'origine ou URL d'abonnement, vide pour un agenda local.
+    /// Chemin d'origine ou URL d'abonnement.
     pub source: String,
-    /// Couleur ARGB.
+    /// Couleur par défaut, quand aucune catégorie ne s'applique.
     pub color: u32,
-    pub visible: bool,
     /// Date de la dernière importation, en secondes Unix.
     pub last_sync: Option<i64>,
+    /// Cours distincts, séries comptées une fois.
     pub event_count: u32,
-    /// Ordre d'affichage sur l'écran d'accueil.
-    pub position: i32,
+    /// Séances développées, toutes dates confondues.
+    pub occurrence_count: u32,
 }
 
-/// Une catégorie visuelle : « CM », « TD », « Examen »…
+/// Une catégorie visuelle : « TD », « Analyse », « Examen »…
 ///
-/// C'est elle qui porte la couleur et la pastille affichées ; les règles ne
-/// font que décider quelle occurrence en reçoit une.
+/// C'est elle qui porte la couleur affichée ; les règles ne font que décider
+/// quelle séance en reçoit une.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Category {
     pub id: String,
     pub name: String,
-    /// Étiquette courte affichée sur les blocs — « TD », « TP », « ★ ».
+    /// Étiquette courte affichée sur les blocs — « TD », « TP ».
     pub label: String,
     pub color: u32,
     pub position: i32,
-    /// Occurrences actuellement classées ici.
+    /// Séances actuellement classées ici.
     pub occurrence_count: u32,
 }
 
-/// Le champ d'une occurrence sur lequel une règle se prononce.
+/// Un champ structuré repéré dans les descriptions importées.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PropertyKey {
+    /// Forme comparable : « matiere ».
+    pub key: String,
+    /// Forme lisible, telle que l'ENT l'écrit : « Matière ».
+    pub label: String,
+    /// Valeurs distinctes prises par ce champ.
+    pub distinct_values: u32,
+    /// Séances qui le renseignent.
+    pub occurrences: u32,
+    /// Valeurs déjà associées à une couleur.
+    pub colored_values: u32,
+}
+
+/// Une valeur d'un champ, et la couleur qu'on lui a donnée.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PropertyValue {
+    pub key: String,
+    pub value: String,
+    pub occurrences: u32,
+    /// Catégorie associée, absente tant qu'aucune couleur n'est posée.
+    pub category_id: Option<String>,
+    /// Couleur effective : celle de la catégorie, ou celle de l'emploi du temps.
+    pub color: u32,
+    pub colored: bool,
+}
+
+/// Le champ d'une séance sur lequel une règle se prononce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum RuleField {
     Title,
     Location,
     Description,
-    /// Les trois à la fois : pratique quand l'ENT range le type du cours
-    /// tantôt dans l'intitulé, tantôt dans la description.
+    /// Un champ structuré de la description, nommé par `Rule::property`.
+    Property,
+    /// Titre, lieu et description à la fois.
     Any,
 }
 
@@ -115,6 +143,7 @@ impl RuleField {
             RuleField::Title => "title",
             RuleField::Location => "location",
             RuleField::Description => "description",
+            RuleField::Property => "property",
             RuleField::Any => "any",
         }
     }
@@ -123,6 +152,7 @@ impl RuleField {
         match s {
             "location" => RuleField::Location,
             "description" => RuleField::Description,
+            "property" => RuleField::Property,
             "any" => RuleField::Any,
             _ => RuleField::Title,
         }
@@ -137,7 +167,7 @@ pub enum RuleMatch {
     EndsWith,
     Equals,
     /// Le motif doit apparaître comme un mot entier : « TD » ne doit pas
-    /// s'accrocher à « STDI ».
+    /// s'accrocher à « BDD ».
     Word,
 }
 
@@ -163,34 +193,34 @@ impl RuleMatch {
     }
 }
 
-/// Une règle visuelle : « si l'intitulé contient TD, classe en TD ».
+/// Une règle visuelle : « si le champ Type vaut TD, colorie en orange ».
 ///
 /// Les règles sont appliquées dans l'ordre de `priority` croissante, et chacune
-/// n'écrase que ce qu'elle renseigne : une règle qui ne fait que masquer laisse
-/// intacte la catégorie posée par une règle précédente.
+/// n'écrase que ce qu'elle renseigne : une règle de couleur et une règle de
+/// masquage se cumulent au lieu de se disputer.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Rule {
     pub id: String,
     pub name: String,
-    /// Restreinte à un agenda, ou appliquée partout si absent.
-    pub calendar_id: Option<String>,
     pub field: RuleField,
+    /// Champ visé quand `field` vaut `Property` — « type », « matiere ».
+    pub property: Option<String>,
     pub match_kind: RuleMatch,
     pub pattern: String,
     pub case_sensitive: bool,
-    /// Catégorie posée sur les occurrences correspondantes.
+    /// Catégorie posée sur les séances correspondantes.
     pub category_id: Option<String>,
     /// Titre de remplacement. `{}` y est remplacé par le titre d'origine.
     pub rename_to: Option<String>,
-    /// Retire l'occurrence de toutes les vues sans toucher à l'import.
+    /// Retire la séance de toutes les vues sans toucher à l'import.
     pub hide: bool,
     pub priority: i32,
     pub enabled: bool,
-    /// Occurrences que cette règle touche actuellement.
+    /// Séances que cette règle touche actuellement.
     pub match_count: u32,
 }
 
-/// Ce qu'une règle décide pour une occurrence.
+/// Ce qu'une règle décide pour une séance.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuleOutcome {
     pub category_id: Option<String>,
@@ -198,24 +228,19 @@ pub(crate) struct RuleOutcome {
     pub hidden: bool,
 }
 
-/// Une occurrence concrète : un cours à une date et une heure précises.
-///
-/// C'est l'unité que manipule l'interface. Les récurrences sont déjà
-/// développées et les règles visuelles déjà appliquées.
+/// Une séance concrète : un cours à une date et une heure précises.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Occurrence {
     /// Identifiant stable au fil des réimports : c'est lui qui permet aux
     /// personnalisations de survivre à une resynchronisation.
     pub id: String,
-    pub calendar_id: String,
-    pub calendar_name: String,
-    /// Couleur retenue pour l'affichage : celle de la catégorie si une règle
-    /// en a posé une, celle de l'agenda sinon.
+    /// Couleur retenue : celle de la catégorie si une règle en a posé une,
+    /// celle de l'emploi du temps sinon.
     pub color: u32,
     pub uid: String,
     /// Titre affiché, renommage appliqué.
     pub title: String,
-    /// Titre tel qu'il est arrivé dans le `.ics`, pour les écrans de réglage.
+    /// Titre tel qu'il est arrivé dans le `.ics`.
     pub raw_title: String,
     pub location: String,
     pub description: String,
@@ -237,12 +262,13 @@ impl Occurrence {
     }
 }
 
-/// Le contenu d'une journée.
+/// Le contenu d'une journée : les séances, et ce qu'il reste à faire.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct DayAgenda {
     /// Nombre de jours depuis le 1er janvier 1970, tel que `LocalDate.toEpochDay()`.
     pub epoch_day: i64,
     pub occurrences: Vec<Occurrence>,
+    pub tasks: Vec<Task>,
 }
 
 /// Ce qu'il faut savoir en une seconde, en sortant d'un cours.
@@ -258,15 +284,37 @@ pub struct NowView {
     pub minutes_remaining: Option<i64>,
     /// Minutes avant le prochain cours.
     pub minutes_until_next: Option<i64>,
+    /// Ce qu'il reste à faire aujourd'hui.
+    pub pending_tasks: u32,
+    /// Parmi elles, celles qui traînent depuis un jour au moins.
+    pub late_tasks: u32,
 }
 
-/// Bilan d'une importation, affiché après avoir chargé un `.ics`.
+/// Une chose à faire dans la journée, sans heure.
+///
+/// Non cochée le soir, elle reparaît le lendemain avec son retard affiché :
+/// c'est tout l'intérêt d'une liste qui ne se vide pas toute seule.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    pub notes: String,
+    /// Jour pour lequel elle était prévue.
+    pub planned_day: i64,
+    pub done: bool,
+    /// Jour où elle a été cochée.
+    pub done_day: Option<i64>,
+    /// Jours de retard à la date consultée, zéro si elle est à sa place.
+    pub days_late: i64,
+    pub position: i32,
+}
+
+/// Bilan d'une importation.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ImportReport {
-    pub calendar_id: String,
     /// Événements distincts lus dans le fichier (séries comprises).
     pub events: u32,
-    /// Occurrences produites sur la fenêtre courante.
+    /// Séances produites sur la fenêtre courante.
     pub occurrences: u32,
     /// Composants ignorés faute d'être exploitables, avec la raison.
     pub skipped: Vec<String>,
@@ -274,26 +322,70 @@ pub struct ImportReport {
     pub last_start_utc: Option<i64>,
 }
 
-/// Ce qu'affiche la tuile d'un agenda sur l'écran d'accueil.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct CalendarSummary {
-    pub calendar: Calendar,
-    /// Séances à venir dans les sept prochains jours.
-    pub upcoming_week: u32,
-    /// La prochaine séance de cet agenda, quelle que soit sa date.
-    pub next: Option<Occurrence>,
-    /// Chevauchements internes non résolus.
-    pub conflicts: u32,
+/// Ce qui a changé entre deux versions de l'emploi du temps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Moved,
+    Cancelled,
+    Room,
 }
 
-/// Un événement à créer ou à modifier.
-///
-/// `id` absent signifie création ; renseigné, il désigne l'occurrence locale
-/// que l'on remplace.
+/// Un changement, déjà rédigé pour être affiché tel quel.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Change {
+    pub kind: ChangeKind,
+    pub title: String,
+    /// Phrase prête à lire : « Le TD d'Analyse de mardi passe de 13:30 à 15:00 ».
+    pub summary: String,
+    /// Quand se tient la séance concernée, après changement.
+    pub start_utc: i64,
+}
+
+/// Bilan d'une synchronisation : ce qui a été lu, et ce qui a bougé.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SyncReport {
+    pub import: ImportReport,
+    /// Changements à venir, du plus proche au plus lointain.
+    pub changes: Vec<Change>,
+}
+
+/// Un rappel à programmer sur l'appareil.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Reminder {
+    pub occurrence_id: String,
+    pub title: String,
+    pub location: String,
+    pub start_utc: i64,
+    /// Instant auquel la notification doit partir.
+    pub trigger_utc: i64,
+}
+
+/// Les réglages persistés, tels que l'écran de configuration les manipule.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Settings {
+    /// URL d'abonnement, vide si l'emploi du temps vient d'un fichier.
+    pub source_url: String,
+    pub sync_enabled: bool,
+    /// Intervalle entre deux synchronisations automatiques.
+    pub sync_interval_hours: u32,
+    pub last_sync_utc: Option<i64>,
+    /// Prévenir quand une séance change de créneau, de salle, ou disparaît.
+    pub notify_changes: bool,
+    pub reminders_enabled: bool,
+    /// Combien de minutes avant le début d'un cours.
+    pub reminder_lead_minutes: u32,
+    /// Résumé du matin : ce qui vient et ce qu'il reste à faire.
+    pub digest_enabled: bool,
+    /// Heure du résumé, en minutes après minuit.
+    pub digest_minutes: u32,
+}
+
+/// Un événement à créer ou à modifier dans l'emploi du temps.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct EventDraft {
     pub id: Option<String>,
-    pub calendar_id: String,
     pub title: String,
     pub location: String,
     pub description: String,
@@ -303,33 +395,21 @@ pub struct EventDraft {
     pub category_id: Option<String>,
 }
 
-/// D'où vient le chevauchement, du point de vue de l'événement examiné.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum ConflictScope {
-    /// Deux créneaux du même agenda se marchent dessus.
-    SameCalendar,
-    /// Le heurt vient d'un autre agenda.
-    CrossCalendar,
-}
-
-/// Un chevauchement constaté entre un projet d'événement et l'existant.
+/// Un chevauchement entre un projet d'événement et l'existant.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Conflict {
-    pub scope: ConflictScope,
-    /// L'occurrence déjà en place.
+    /// La séance déjà en place.
     pub other: Occurrence,
     /// Durée du recouvrement, en minutes.
     pub overlap_minutes: i64,
-    /// Vrai si l'occurrence en place peut être supprimée (séance locale) ;
-    /// faux si elle ne peut être que masquée (séance importée).
+    /// Vrai si elle peut être supprimée (séance saisie ici) ; faux si elle ne
+    /// peut être que masquée (séance importée).
     pub other_deletable: bool,
 }
 
-/// Un chevauchement entre deux occurrences déjà enregistrées, tel que le
-/// gestionnaire de conflits le présente.
+/// Un chevauchement entre deux séances déjà enregistrées.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ConflictPair {
-    pub scope: ConflictScope,
     pub first: Occurrence,
     pub second: Occurrence,
     pub overlap_minutes: i64,
@@ -338,13 +418,13 @@ pub struct ConflictPair {
 /// Ce que l'utilisateur décide face à un chevauchement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum Resolution {
-    /// Ne rien écrire tant que le conflit tient : c'est le mode par défaut,
-    /// celui qui déclenche la question.
+    /// Ne rien écrire tant que le conflit tient : le défaut, celui qui
+    /// déclenche la question.
     Cancel,
-    /// Écrire quand même : deux cours peuvent légitimement se chevaucher.
+    /// Écrire quand même : deux créneaux peuvent légitimement se chevaucher.
     Ignore,
-    /// Faire place nette : les séances en conflit sont supprimées si elles
-    /// sont locales, masquées si elles viennent d'un import.
+    /// Faire place nette : les séances en conflit sont supprimées si elles ont
+    /// été saisies ici, masquées si elles viennent de l'import.
     Replace,
     /// Décaler le nouvel événement juste après le dernier conflit, à durée
     /// constante.
@@ -354,31 +434,32 @@ pub enum Resolution {
 /// Résultat d'une écriture d'événement.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SaveOutcome {
-    /// L'occurrence écrite, absente si l'écriture a été retenue.
+    /// La séance écrite, absente si l'écriture a été retenue.
     pub saved: Option<Occurrence>,
     /// Les chevauchements rencontrés, qu'ils aient été résolus ou non.
     pub conflicts: Vec<Conflict>,
     /// Vrai si rien n'a été écrit et qu'il faut interroger l'utilisateur.
     pub blocked: bool,
-    /// Occurrences supprimées par un remplacement.
+    /// Séances supprimées par un remplacement.
     pub removed: u32,
-    /// Occurrences masquées par un remplacement.
+    /// Séances masquées par un remplacement.
     pub hidden: u32,
     /// Décalage appliqué, en minutes, si la résolution était `ShiftAfter`.
     pub shifted_minutes: i64,
 }
 
-/// Une règle que le cœur propose de créer, déduite de ce qui a été importé.
+/// Une règle que le cœur propose, déduite de ce qui a été importé.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RuleSuggestion {
-    /// Intitulé lisible : « Les cours marqués TD ».
+    /// Intitulé lisible : « Colorier par Matière ».
     pub label: String,
     pub field: RuleField,
+    pub property: Option<String>,
     pub match_kind: RuleMatch,
     pub pattern: String,
-    /// Occurrences que la règle toucherait.
+    /// Séances que la règle toucherait.
     pub occurrences: u32,
-    /// Quelques titres concernés, pour que l'utilisateur vérifie avant.
+    /// Quelques exemples, pour que l'utilisateur vérifie avant.
     pub samples: Vec<String>,
     /// Couleur proposée, prise dans la palette et encore inutilisée.
     pub suggested_color: u32,

@@ -1,4 +1,4 @@
-//! Stockage local et requêtes d'agenda.
+//! Stockage local et requêtes.
 //!
 //! Le parti pris structurant : les récurrences sont développées à l'import et
 //! écrites en dur dans `occurrences`. Afficher une journée ou une semaine
@@ -6,24 +6,24 @@
 //! une requête à une ligne. Le flux `.ics` d'origine est conservé pour pouvoir
 //! re-développer plus loin dans le temps sans redemander le fichier.
 //!
-//! Les décisions des règles visuelles suivent le même principe : elles sont
-//! matérialisées dans les colonnes de `occurrences` au moment de l'écriture,
-//! puis rejouées d'un bloc quand une règle change. Une vue ne calcule jamais
-//! rien, elle lit.
+//! Les champs structurés de la description et les décisions des règles suivent
+//! le même principe : matérialisés à l'écriture, rejoués d'un bloc quand une
+//! règle change. Une vue ne calcule jamais rien, elle lit.
 
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
-use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::conflict;
 use crate::error::{Result, TimewrapError};
 use crate::ics;
 use crate::model::{
-    Calendar, CalendarKind, CalendarSummary, Category, Conflict, ConflictPair, DayAgenda,
-    EventDraft, EventOrigin, ImportReport, NowView, Occurrence, Resolution, Rule, RuleField,
-    RuleMatch, RuleSuggestion, SaveOutcome,
+    CalendarKind, Category, Change, ChangeKind, Conflict, ConflictPair, DayAgenda, EventDraft,
+    EventOrigin, ImportReport, NowView, Occurrence, PropertyKey, PropertyValue, Reminder,
+    Resolution, Rule, RuleField, RuleMatch, RuleSuggestion, SaveOutcome, Settings, SyncReport,
+    Task, Timetable,
 };
+use crate::properties::{self, Property};
 use crate::rules;
 
 /// Combien de passé on garde développé.
@@ -34,13 +34,15 @@ const HORIZON_FUTURE: Duration = Duration::days(400);
 const HORIZON_MARGIN: Duration = Duration::days(60);
 /// Fenêtre examinée autour d'un événement pour y chercher des chevauchements.
 const CONFLICT_WINDOW: Duration = Duration::days(1);
-/// Profondeur sur laquelle l'écran d'accueil compte les conflits d'un agenda.
-const CONFLICT_LOOKAHEAD: Duration = Duration::days(30);
+/// Profondeur sur laquelle une synchronisation compare l'avant et l'après.
+const DIFF_HORIZON: Duration = Duration::days(45);
 /// Un décalage en cascade doit finir par retomber sur un créneau libre.
 const MAX_SHIFT_STEPS: u8 = 8;
+/// Au-delà, une liste de changements n'est plus lisible dans une notification.
+const MAX_CHANGES: usize = 40;
 
-/// Couleurs attribuées aux agendas et aux catégories dans l'ordre de création.
-const PALETTE: [u32; 8] = [
+/// Couleurs attribuées aux catégories dans l'ordre de création.
+pub const PALETTE: [u32; 8] = [
     0xFF4C5FD5, // bleu-violet
     0xFF2E9E7A, // vert
     0xFFD2694B, // terre cuite
@@ -51,12 +53,15 @@ const PALETTE: [u32; 8] = [
     0xFFB08236, // ambre
 ];
 
-/// Colonnes d'une occurrence telle que l'interface la reçoit.
+/// Couleur de l'emploi du temps quand rien n'a encore été personnalisé.
+const DEFAULT_COLOR: u32 = PALETTE[0];
+
+/// Colonnes d'une séance telle que l'interface la reçoit.
 ///
 /// La couleur et le titre sont résolus ici, en SQL : la catégorie posée par une
-/// règle l'emporte sur la couleur de l'agenda, et le renommage sur l'intitulé
+/// règle l'emporte sur la couleur par défaut, et le renommage sur l'intitulé
 /// d'origine — que l'on continue de renvoyer à part, pour les écrans de réglage.
-const OCC_COLUMNS: &str = "o.id, o.calendar_id, c.name, COALESCE(cat.color, c.color), o.uid,
+const OCC_COLUMNS: &str = "o.id, COALESCE(cat.color, c.color), o.uid,
      CASE WHEN o.display_title <> '' THEN o.display_title ELSE o.summary END,
      o.summary, o.location, o.description, o.start_utc, o.end_utc, o.all_day,
      o.cancelled, o.origin, o.category_id, COALESCE(cat.name, ''),
@@ -67,13 +72,8 @@ const OCC_FROM: &str = "FROM occurrences o
      JOIN calendars c ON c.id = o.calendar_id
      LEFT JOIN categories cat ON cat.id = o.category_id";
 
-/// Restriction d'une vue à certains agendas.
-///
-/// Vide ou absent, on retombe sur le comportement habituel : tous les agendas
-/// que l'utilisateur n'a pas masqués. Renseignée, la sélection l'emporte sur la
-/// visibilité — ouvrir le dossier « Perso » doit le montrer, même s'il est
-/// décoché dans la vue d'ensemble.
-pub type Scope = Option<Vec<String>>;
+/// Les séances visibles : ni masquées par une règle, ni écartées à la main.
+const VISIBLE: &str = "o.hidden = 0 AND o.muted = 0";
 
 pub struct Store {
     conn: Connection,
@@ -144,7 +144,7 @@ impl Store {
             )?;
         }
 
-        // v2 : dossiers ordonnables, événements locaux, catégories et règles.
+        // v2 : événements saisis sur place, catégories et règles.
         //
         // Les décisions des règles sont stockées à côté des données brutes plutôt
         // qu'à leur place : `summary` reste ce que disait l'ENT, `display_title`
@@ -172,7 +172,7 @@ impl Store {
                  CREATE TABLE rules (
                      id             TEXT PRIMARY KEY,
                      name           TEXT NOT NULL,
-                     calendar_id    TEXT REFERENCES calendars(id) ON DELETE CASCADE,
+                     calendar_id    TEXT,
                      field          TEXT NOT NULL DEFAULT 'title',
                      match_kind     TEXT NOT NULL DEFAULT 'contains',
                      pattern        TEXT NOT NULL,
@@ -189,23 +189,84 @@ impl Store {
 
                  PRAGMA user_version = 2;",
             )?;
+        }
 
-            // Les agendas déjà présents gardent leur ordre d'arrivée.
+        // v3 : un seul emploi du temps, les champs structurés de la description,
+        // et la liste de choses à faire.
+        //
+        // Gérer plusieurs agendas revenait à demander de ranger avant de
+        // consulter. Ce qui n'a pas d'heure — un devoir, une démarche — n'était
+        // de toute façon pas un créneau : c'est une tâche, et elle se reporte au
+        // lendemain tant qu'elle n'est pas cochée.
+        if version < 3 {
             self.conn.execute_batch(
-                "UPDATE calendars SET position = (
-                     SELECT COUNT(*) FROM calendars older
-                     WHERE older.created_at < calendars.created_at
-                 );",
+                "ALTER TABLE rules ADD COLUMN property TEXT;
+
+                 CREATE TABLE occurrence_props (
+                     occurrence_id TEXT NOT NULL
+                         REFERENCES occurrences(id) ON DELETE CASCADE,
+                     key           TEXT NOT NULL,
+                     label         TEXT NOT NULL,
+                     value         TEXT NOT NULL,
+                     PRIMARY KEY (occurrence_id, key)
+                 );
+                 CREATE INDEX idx_props_key ON occurrence_props(key, value);
+
+                 CREATE TABLE tasks (
+                     id          TEXT PRIMARY KEY,
+                     title       TEXT NOT NULL,
+                     notes       TEXT NOT NULL DEFAULT '',
+                     planned_day INTEGER NOT NULL,
+                     done        INTEGER NOT NULL DEFAULT 0,
+                     done_day    INTEGER,
+                     created_at  INTEGER NOT NULL,
+                     position    INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX idx_tasks_day ON tasks(planned_day, done);",
             )?;
+
+            self.consolidate_calendars()?;
+            self.conn.execute_batch("PRAGMA user_version = 3;")?;
         }
 
         Ok(())
     }
 
+    /// Ramène d'anciennes bases à un emploi du temps unique.
+    ///
+    /// Les séances saisies à la main dans un agenda annexe sont rattachées à
+    /// celui qu'on garde plutôt que supprimées : elles n'ont pas démérité parce
+    /// que l'application a changé d'avis sur son organisation.
+    fn consolidate_calendars(&self) -> Result<()> {
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM calendars
+                 ORDER BY CASE WHEN raw_ics <> '' THEN 0 ELSE 1 END, created_at",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let Some((keep, extras)) = ids.split_first() else {
+            return Ok(());
+        };
+        for extra in extras {
+            self.conn.execute(
+                "UPDATE occurrences SET calendar_id = ?1
+                 WHERE calendar_id = ?2 AND origin = 'local'",
+                params![keep, extra],
+            )?;
+            self.conn
+                .execute("DELETE FROM calendars WHERE id = ?1", params![extra])?;
+        }
+        self.conn.execute("UPDATE calendars SET visible = 1", [])?;
+        Ok(())
+    }
+
     /// Exécute un bloc d'écritures d'un seul tenant.
     ///
-    /// Un import qui échoue à mi-course ne doit pas laisser un agenda à moitié
-    /// développé : soit tout est écrit, soit rien.
+    /// Un import qui échoue à mi-course ne doit pas laisser un emploi du temps à
+    /// moitié développé : soit tout est écrit, soit rien.
     fn transact<T>(&self, block: impl FnOnce() -> Result<T>) -> Result<T> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match block() {
@@ -229,62 +290,43 @@ impl Store {
         self.set_setting("display_tz", tz)
     }
 
-    // ---------------------------------------------------------------- agendas
+    // ------------------------------------------------------- emploi du temps
 
-    pub fn calendars(&self) -> Result<Vec<Calendar>> {
+    /// L'emploi du temps, s'il y en a un.
+    pub fn timetable(&self) -> Result<Option<Timetable>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.name, c.kind, c.source, c.color, c.visible, c.last_sync,
+            "SELECT c.id, c.name, c.kind, c.source, c.color, c.last_sync,
                     (SELECT COUNT(DISTINCT o.uid) FROM occurrences o WHERE o.calendar_id = c.id),
-                    c.position
-             FROM calendars c
-             ORDER BY c.position, c.created_at",
+                    (SELECT COUNT(*) FROM occurrences o WHERE o.calendar_id = c.id)
+             FROM calendars c ORDER BY c.created_at LIMIT 1",
         )?;
-        let rows = stmt.query_map([], read_calendar)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok(stmt
+            .query_row([], |row| {
+                Ok(Timetable {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: CalendarKind::from_str(&row.get::<_, String>(2)?),
+                    source: row.get(3)?,
+                    color: row.get::<_, i64>(4)? as u32,
+                    last_sync: row.get(5)?,
+                    event_count: row.get::<_, i64>(6)? as u32,
+                    occurrence_count: row.get::<_, i64>(7)? as u32,
+                })
+            })
+            .optional()?)
     }
 
-    pub fn calendar(&self, calendar_id: &str) -> Result<Calendar> {
-        let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.name, c.kind, c.source, c.color, c.visible, c.last_sync,
-                    (SELECT COUNT(DISTINCT o.uid) FROM occurrences o WHERE o.calendar_id = c.id),
-                    c.position
-             FROM calendars c WHERE c.id = ?1",
-        )?;
-        stmt.query_row(params![calendar_id], read_calendar)
-            .optional()?
-            .ok_or_else(|| TimewrapError::CalendarNotFound(calendar_id.to_string()))
+    fn timetable_id(&self) -> Result<String> {
+        self.timetable()?
+            .map(|t| t.id)
+            .ok_or_else(|| TimewrapError::NotFound("aucun emploi du temps importé".into()))
     }
 
-    /// Crée un agenda vide — un dossier, à remplir à la main.
-    pub fn create_calendar(
-        &self,
-        name: &str,
-        kind: CalendarKind,
-        source: &str,
-        color: Option<u32>,
-        now_utc: i64,
-    ) -> Result<Calendar> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(TimewrapError::InvalidEvent(
-                "un agenda a besoin d'un nom".into(),
-            ));
-        }
-        let id = new_id("cal", now_utc, name);
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM calendars", [], |row| row.get(0))?;
-        let color = color.unwrap_or(PALETTE[(count as usize) % PALETTE.len()]);
-
-        self.conn.execute(
-            "INSERT INTO calendars (id, name, kind, source, color, visible, created_at, raw_ics, position)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, '', ?7)",
-            params![id, name, kind.as_str(), source, color as i64, now_utc, count],
-        )?;
-        self.calendar(&id)
-    }
-
-    /// Crée un agenda à partir d'un flux `.ics` et développe ses occurrences.
+    /// Installe ou remplace le contenu de l'emploi du temps.
+    ///
+    /// L'identité de l'emploi du temps ne change jamais : réimporter un fichier
+    /// ou resynchroniser une URL réécrit les séances venues du flux, et laisse
+    /// intactes celles ajoutées ici, les masquages et les personnalisations.
     pub fn import_ics(
         &self,
         name: &str,
@@ -292,44 +334,85 @@ impl Store {
         source: &str,
         ics_text: &str,
         now_utc: i64,
-    ) -> Result<ImportReport> {
-        let calendar = self.create_calendar(name, kind, source, None, now_utc)?;
+    ) -> Result<SyncReport> {
+        let id = match self.timetable()? {
+            Some(existing) => {
+                self.conn.execute(
+                    "UPDATE calendars SET name = ?2, kind = ?3, source = ?4 WHERE id = ?1",
+                    params![existing.id, name.trim(), kind.as_str(), source],
+                )?;
+                existing.id
+            }
+            None => {
+                let id = new_id("cal", now_utc, name);
+                self.conn.execute(
+                    "INSERT INTO calendars
+                     (id, name, kind, source, color, visible, created_at, raw_ics)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, '')",
+                    params![
+                        id,
+                        name.trim(),
+                        kind.as_str(),
+                        source,
+                        DEFAULT_COLOR as i64,
+                        now_utc
+                    ],
+                )?;
+                id
+            }
+        };
+
         self.conn.execute(
             "UPDATE calendars SET raw_ics = ?2 WHERE id = ?1",
-            params![calendar.id, ics_text],
+            params![id, ics_text],
         )?;
-        self.rebuild(&calendar.id, ics_text, now_utc)
+        if kind == CalendarKind::IcsUrl {
+            self.set_setting("source_url", source)?;
+        }
+
+        let before = self.diff_snapshot(now_utc)?;
+        let import = self.rebuild(&id, ics_text, now_utc)?;
+        let after = self.diff_snapshot(now_utc)?;
+
+        Ok(SyncReport {
+            import,
+            changes: self.describe_changes(&before, &after),
+        })
     }
 
-    /// Remplace le contenu d'un agenda existant par un flux `.ics` plus récent.
-    pub fn reimport_ics(
-        &self,
-        calendar_id: &str,
-        ics_text: &str,
-        now_utc: i64,
-    ) -> Result<ImportReport> {
-        self.require_calendar(calendar_id)?;
-        self.conn.execute(
-            "UPDATE calendars SET raw_ics = ?2 WHERE id = ?1",
-            params![calendar_id, ics_text],
-        )?;
-        self.rebuild(calendar_id, ics_text, now_utc)
+    pub fn set_color(&self, color: u32) -> Result<()> {
+        self.conn
+            .execute("UPDATE calendars SET color = ?1", params![color as i64])?;
+        Ok(())
     }
 
-    /// Développe le flux et réécrit les occurrences importées de cet agenda.
+    pub fn rename(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE calendars SET name = ?1", params![name.trim()])?;
+        Ok(())
+    }
+
+    /// Efface l'emploi du temps et tout ce qui en dépend. Les tâches restent :
+    /// elles ne viennent pas de l'ENT.
+    pub fn clear_timetable(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM calendars", [])?;
+        Ok(())
+    }
+
+    /// Développe le flux et réécrit les séances importées.
     ///
     /// Le remplacement est intégral, donc idempotent : réimporter deux fois le
     /// même fichier laisse exactement le même état. Deux choses y survivent
     /// pourtant, parce qu'elles n'appartiennent pas au flux : les événements
-    /// saisis à la main dans le même agenda, et les séances masquées à la suite
-    /// d'un conflit — les identifiants d'occurrence étant stables, on les repose.
+    /// saisis à la main, et les séances masquées à la suite d'un conflit — les
+    /// identifiants d'occurrence étant stables, on les repose.
     fn rebuild(&self, calendar_id: &str, ics_text: &str, now_utc: i64) -> Result<ImportReport> {
         let (from, to) = horizon(now_utc);
         let expansion = ics::expand(ics_text, from, to, self.tz)?;
         let rules = self.rules_raw()?;
 
         self.transact(|| {
-            let muted = self.muted_ids(calendar_id)?;
+            let muted = self.muted_ids()?;
 
             self.conn.execute(
                 "DELETE FROM occurrences WHERE calendar_id = ?1 AND origin = 'ics'",
@@ -345,17 +428,19 @@ impl Store {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, 0)",
                 )?;
                 for occurrence in &expansion.occurrences {
+                    let props = properties::parse(&occurrence.description);
                     let outcome = rules::apply(
                         &rules,
                         &rules::Fields {
-                            calendar_id,
                             title: &occurrence.summary,
                             location: &occurrence.location,
                             description: &occurrence.description,
+                            properties: &props,
                         },
                     );
+                    let id = occurrence_id(calendar_id, &occurrence.uid, occurrence.start_utc);
                     stmt.execute(params![
-                        occurrence_id(calendar_id, &occurrence.uid, occurrence.start_utc),
+                        id,
                         calendar_id,
                         occurrence.uid,
                         occurrence.summary,
@@ -370,6 +455,7 @@ impl Store {
                         outcome.category_id,
                         outcome.hidden as i64,
                     ])?;
+                    self.write_properties(&id, &props)?;
                 }
             }
 
@@ -386,11 +472,11 @@ impl Store {
             )?;
             self.set_setting("horizon_from", &from.to_string())?;
             self.set_setting("horizon_to", &to.to_string())?;
+            self.set_setting("last_sync_utc", &now_utc.to_string())?;
             Ok(())
         })?;
 
         Ok(ImportReport {
-            calendar_id: calendar_id.to_string(),
             events: expansion.events,
             occurrences: expansion.occurrences.len() as u32,
             skipped: expansion.skipped,
@@ -399,21 +485,37 @@ impl Store {
         })
     }
 
-    fn muted_ids(&self, calendar_id: &str) -> Result<Vec<String>> {
+    fn write_properties(&self, occurrence_id: &str, props: &[Property]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM occurrence_props WHERE occurrence_id = ?1",
+            params![occurrence_id],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT OR REPLACE INTO occurrence_props (occurrence_id, key, label, value)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for property in props {
+            stmt.execute(params![
+                occurrence_id,
+                property.key,
+                property.label,
+                property.value
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn muted_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM occurrences WHERE calendar_id = ?1 AND muted = 1")?;
-        let rows = stmt.query_map(params![calendar_id], |row| row.get(0))?;
+            .prepare("SELECT id FROM occurrences WHERE muted = 1")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Re-développe tous les agendas si l'horizon devient trop proche.
-    ///
-    /// Sans cela, une application ouverte un an après le dernier import
-    /// n'afficherait plus rien au-delà de la fenêtre initiale.
+    /// Re-développe l'emploi du temps si l'horizon devient trop proche.
     pub fn ensure_horizon(&self, now_utc: i64) -> Result<bool> {
         let horizon_to: Option<i64> = self.get_setting("horizon_to")?.and_then(|v| v.parse().ok());
-
         let needs_refresh = match horizon_to {
             Some(to) => now_utc + HORIZON_MARGIN.num_seconds() > to,
             None => false,
@@ -422,73 +524,146 @@ impl Store {
             return Ok(false);
         }
 
-        let sources: Vec<(String, String)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, raw_ics FROM calendars WHERE raw_ics <> ''")?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let source: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, raw_ics FROM calendars WHERE raw_ics <> '' LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
 
-        for (id, raw) in sources {
+        if let Some((id, raw)) = source {
             self.rebuild(&id, &raw, now_utc)?;
+            return Ok(true);
         }
-        Ok(true)
+        Ok(false)
     }
 
-    pub fn set_visible(&self, calendar_id: &str, visible: bool) -> Result<()> {
-        self.require_calendar(calendar_id)?;
-        self.conn.execute(
-            "UPDATE calendars SET visible = ?2 WHERE id = ?1",
-            params![calendar_id, visible as i64],
+    // ------------------------------------------------ différence entre imports
+
+    /// Ce que l'on retient d'une séance pour savoir si elle a bougé.
+    fn diff_snapshot(&self, now_utc: i64) -> Result<Vec<Snapshot>> {
+        let to = now_utc + DIFF_HORIZON.num_seconds();
+        let mut stmt = self.conn.prepare(
+            "SELECT uid, summary, location, start_utc, cancelled
+             FROM occurrences
+             WHERE origin = 'ics' AND start_utc >= ?1 AND start_utc < ?2
+             ORDER BY start_utc",
         )?;
-        Ok(())
+        let rows = stmt.query_map(params![now_utc, to], |row| {
+            Ok(Snapshot {
+                uid: row.get(0)?,
+                title: row.get(1)?,
+                location: row.get(2)?,
+                start_utc: row.get(3)?,
+                cancelled: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub fn set_color(&self, calendar_id: &str, color: u32) -> Result<()> {
-        self.require_calendar(calendar_id)?;
-        self.conn.execute(
-            "UPDATE calendars SET color = ?2 WHERE id = ?1",
-            params![calendar_id, color as i64],
-        )?;
-        Ok(())
-    }
+    /// Rédige, en français, ce qui a changé entre deux états.
+    ///
+    /// L'appariement se fait par UID : une séance qui garde le sien a été
+    /// déplacée, pas supprimée puis recréée. C'est la différence entre « ton TD
+    /// de mardi passe à 15h » et deux notifications illisibles.
+    fn describe_changes(&self, before: &[Snapshot], after: &[Snapshot]) -> Vec<Change> {
+        let mut changes = Vec::new();
 
-    pub fn rename_calendar(&self, calendar_id: &str, name: &str) -> Result<()> {
-        self.require_calendar(calendar_id)?;
-        self.conn.execute(
-            "UPDATE calendars SET name = ?2 WHERE id = ?1",
-            params![calendar_id, name],
-        )?;
-        Ok(())
-    }
-
-    /// Range un agenda à une nouvelle place dans la liste d'accueil.
-    pub fn move_calendar(&self, calendar_id: &str, target: i32) -> Result<()> {
-        let mut ids: Vec<String> = self.calendars()?.into_iter().map(|c| c.id).collect();
-        let Some(from) = ids.iter().position(|id| id == calendar_id) else {
-            return Err(TimewrapError::CalendarNotFound(calendar_id.to_string()));
-        };
-        let to = (target.max(0) as usize).min(ids.len().saturating_sub(1));
-        let moved = ids.remove(from);
-        ids.insert(to, moved);
-
-        self.transact(|| {
-            for (position, id) in ids.iter().enumerate() {
-                self.conn.execute(
-                    "UPDATE calendars SET position = ?2 WHERE id = ?1",
-                    params![id, position as i64],
-                )?;
+        for old in before {
+            match after.iter().find(|n| n.same_slot(old)) {
+                Some(new) => {
+                    if new.cancelled && !old.cancelled {
+                        let summary = format!(
+                            "« {} » du {} est annulé",
+                            new.title,
+                            self.day_label(new.start_utc)
+                        );
+                        changes.push(change(ChangeKind::Cancelled, new, summary));
+                    } else if new.location != old.location && !new.location.is_empty() {
+                        let summary = format!(
+                            "« {} » du {} change de salle : {} → {}",
+                            new.title,
+                            self.day_label(new.start_utc),
+                            if old.location.is_empty() {
+                                "sans salle"
+                            } else {
+                                &old.location
+                            },
+                            new.location
+                        );
+                        changes.push(change(ChangeKind::Room, new, summary));
+                    }
+                }
+                None => match after
+                    .iter()
+                    .find(|n| n.uid == old.uid && !n.matched(before))
+                {
+                    Some(moved) => {
+                        let summary = format!(
+                            "« {} » passe du {} au {}",
+                            moved.title,
+                            self.slot_label(old.start_utc),
+                            self.slot_label(moved.start_utc)
+                        );
+                        changes.push(change(ChangeKind::Moved, moved, summary));
+                    }
+                    None => {
+                        let summary = format!(
+                            "« {} » du {} est retiré de l'emploi du temps",
+                            old.title,
+                            self.slot_label(old.start_utc)
+                        );
+                        changes.push(change(ChangeKind::Removed, old, summary));
+                    }
+                },
             }
-            Ok(())
-        })
+        }
+
+        for new in after {
+            let known = before.iter().any(|o| o.same_slot(new) || o.uid == new.uid);
+            if !known {
+                let summary = format!(
+                    "« {} » ajouté le {}",
+                    new.title,
+                    self.slot_label(new.start_utc)
+                );
+                changes.push(change(ChangeKind::Added, new, summary));
+            }
+        }
+
+        changes.sort_by_key(|c| c.start_utc);
+        changes.truncate(MAX_CHANGES);
+        changes
     }
 
-    pub fn delete_calendar(&self, calendar_id: &str) -> Result<()> {
-        self.require_calendar(calendar_id)?;
-        self.conn
-            .execute("DELETE FROM calendars WHERE id = ?1", params![calendar_id])?;
-        Ok(())
+    /// « mardi 22 septembre »
+    fn day_label(&self, utc: i64) -> String {
+        let Some(dt) = DateTime::from_timestamp(utc, 0) else {
+            return String::new();
+        };
+        let local = dt.with_timezone(&self.tz);
+        format!(
+            "{} {} {}",
+            weekday_name(local.weekday().num_days_from_monday()),
+            local.day(),
+            month_name(local.month())
+        )
+    }
+
+    /// « mardi 22 septembre à 13:30 »
+    fn slot_label(&self, utc: i64) -> String {
+        let Some(dt) = DateTime::from_timestamp(utc, 0) else {
+            return String::new();
+        };
+        let local = dt.with_timezone(&self.tz);
+        format!(
+            "{} à {:02}:{:02}",
+            self.day_label(utc),
+            local.hour(),
+            local.minute()
+        )
     }
 
     // ------------------------------------------------------------- catégories
@@ -559,16 +734,17 @@ impl Store {
     pub fn delete_category(&self, id: &str) -> Result<()> {
         self.transact(|| {
             self.conn
+                .execute("DELETE FROM rules WHERE category_id = ?1", params![id])?;
+            self.conn
                 .execute("DELETE FROM categories WHERE id = ?1", params![id])?;
-            // Les clés étrangères remettent déjà `category_id` à NULL ; on le
-            // fait explicitement pour rester correct si la base a été ouverte
-            // sans `foreign_keys`.
             self.conn.execute(
                 "UPDATE occurrences SET category_id = NULL WHERE category_id = ?1",
                 params![id],
             )?;
             Ok(())
-        })
+        })?;
+        self.reapply_rules()?;
+        Ok(())
     }
 
     fn category(&self, id: &str) -> Result<Category> {
@@ -591,11 +767,241 @@ impl Store {
             .unwrap_or(PALETTE[fallback_index % PALETTE.len()])
     }
 
+    // ------------------------------------------------------ champs structurés
+
+    /// Les champs repérés dans les descriptions, du plus renseigné au moins.
+    pub fn property_keys(&self) -> Result<Vec<PropertyKey>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.key, MIN(p.label), COUNT(DISTINCT p.value), COUNT(*)
+             FROM occurrence_props p
+             GROUP BY p.key
+             ORDER BY COUNT(*) DESC, p.key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u32,
+                row.get::<_, i64>(3)? as u32,
+            ))
+        })?;
+
+        let keys = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let rules = self.rules_raw()?;
+        Ok(keys
+            .into_iter()
+            .map(|(key, label, distinct_values, occurrences)| {
+                let colored_values = rules
+                    .iter()
+                    .filter(|r| {
+                        r.property.as_deref() == Some(key.as_str()) && r.category_id.is_some()
+                    })
+                    .count() as u32;
+                PropertyKey {
+                    key,
+                    label,
+                    distinct_values,
+                    occurrences,
+                    colored_values,
+                }
+            })
+            .collect())
+    }
+
+    /// Les valeurs d'un champ, avec la couleur que chacune porte aujourd'hui.
+    ///
+    /// C'est la matière de l'écran des couleurs : une ligne par matière, une
+    /// ligne par type de cours, chacune avec sa pastille à changer.
+    pub fn property_values(&self, key: &str) -> Result<Vec<PropertyValue>> {
+        let key = properties::normalize(key);
+        let default_color = self.timetable()?.map(|t| t.color).unwrap_or(DEFAULT_COLOR);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT value, COUNT(*) FROM occurrence_props
+             WHERE key = ?1 GROUP BY value ORDER BY COUNT(*) DESC, value",
+        )?;
+        let rows = stmt.query_map(params![key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+        })?;
+        let values = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let rules = self.rules_raw()?;
+        let categories = self.categories()?;
+
+        Ok(values
+            .into_iter()
+            .map(|(value, occurrences)| {
+                let category = rules
+                    .iter()
+                    .find(|r| {
+                        r.property.as_deref() == Some(key.as_str())
+                            && r.pattern.eq_ignore_ascii_case(&value)
+                            && r.category_id.is_some()
+                    })
+                    .and_then(|r| r.category_id.clone())
+                    .and_then(|id| categories.iter().find(|c| c.id == id).cloned());
+
+                PropertyValue {
+                    key: key.clone(),
+                    value,
+                    occurrences,
+                    color: category.as_ref().map(|c| c.color).unwrap_or(default_color),
+                    colored: category.is_some(),
+                    category_id: category.map(|c| c.id),
+                }
+            })
+            .collect())
+    }
+
+    /// Donne une couleur à une valeur de champ — « Matière : Analyse » en vert.
+    ///
+    /// Sous le capot, une catégorie et la règle qui la pose. L'utilisateur, lui,
+    /// n'a vu qu'une pastille : c'est tout l'intérêt de ne pas lui demander
+    /// d'écrire une règle pour chaque matière.
+    pub fn set_property_color(
+        &self,
+        key: &str,
+        value: &str,
+        color: u32,
+        now_utc: i64,
+    ) -> Result<Category> {
+        let key = properties::normalize(key);
+        let existing = self.rules_raw()?.into_iter().find(|r| {
+            r.property.as_deref() == Some(key.as_str()) && r.pattern.eq_ignore_ascii_case(value)
+        });
+
+        if let Some(rule) = existing
+            && let Some(category_id) = rule.category_id
+        {
+            let category = self.category(&category_id)?;
+            return self.update_category(&category_id, &category.name, &category.label, color);
+        }
+
+        let label = self.property_label(&key)?;
+        let category = self.create_category(value, &short_label(value), Some(color), now_utc)?;
+        self.save_rule(
+            &Rule {
+                id: String::new(),
+                name: format!("{label} : {value}"),
+                field: RuleField::Property,
+                property: Some(key),
+                match_kind: RuleMatch::Equals,
+                pattern: value.to_string(),
+                case_sensitive: false,
+                category_id: Some(category.id.clone()),
+                rename_to: None,
+                hide: false,
+                priority: 0,
+                enabled: true,
+                match_count: 0,
+            },
+            now_utc,
+        )?;
+        self.category(&category.id)
+    }
+
+    /// Retire la couleur d'une valeur : la règle et sa catégorie disparaissent.
+    pub fn clear_property_color(&self, key: &str, value: &str) -> Result<()> {
+        let key = properties::normalize(key);
+        let rules: Vec<Rule> = self
+            .rules_raw()?
+            .into_iter()
+            .filter(|r| {
+                r.property.as_deref() == Some(key.as_str()) && r.pattern.eq_ignore_ascii_case(value)
+            })
+            .collect();
+
+        for rule in rules {
+            self.conn
+                .execute("DELETE FROM rules WHERE id = ?1", params![rule.id])?;
+            if let Some(category_id) = &rule.category_id {
+                self.delete_category(category_id)?;
+            }
+        }
+        self.reapply_rules()?;
+        Ok(())
+    }
+
+    /// Attribue d'un coup une couleur à chaque valeur d'un champ.
+    ///
+    /// « Colorier par matière » en un geste : c'est ce que l'on veut faire neuf
+    /// fois sur dix, et le faire valeur par valeur serait absurde.
+    pub fn auto_color_property(&self, key: &str, now_utc: i64) -> Result<u32> {
+        let key = properties::normalize(key);
+        let values = self.property_values(&key)?;
+        let mut colored = 0;
+
+        for (index, value) in values.iter().enumerate() {
+            if value.colored {
+                continue;
+            }
+            let color = PALETTE[index % PALETTE.len()];
+            self.set_property_color(&key, &value.value, color, now_utc + index as i64)?;
+            colored += 1;
+        }
+        Ok(colored)
+    }
+
+    fn property_label(&self, key: &str) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT label FROM occurrence_props WHERE key = ?1 LIMIT 1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| key.to_string()))
+    }
+
+    /// Les champs structurés d'une séance, tels que sa fiche les affiche.
+    pub fn occurrence_properties(&self, id: &str) -> Result<Vec<PropertyValue>> {
+        let default_color = self.timetable()?.map(|t| t.color).unwrap_or(DEFAULT_COLOR);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM occurrence_props WHERE occurrence_id = ?1")?;
+        let rows = stmt.query_map(params![id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let own = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut out = Vec::new();
+        for (key, value) in own {
+            let known = self
+                .property_values(&key)?
+                .into_iter()
+                .find(|v| v.value == value);
+            out.push(known.unwrap_or(PropertyValue {
+                key,
+                value,
+                occurrences: 1,
+                category_id: None,
+                color: default_color,
+                colored: false,
+            }));
+        }
+        Ok(out)
+    }
+
     // ----------------------------------------------------------------- règles
 
     pub fn rules(&self) -> Result<Vec<Rule>> {
+        let mut rules = self.rules_raw()?;
+        let samples = self.rule_inputs()?;
+        for rule in &mut rules {
+            rule.match_count = samples
+                .iter()
+                .filter(|sample| rules::matches(rule, &sample.fields()))
+                .count() as u32;
+        }
+        Ok(rules)
+    }
+
+    /// Les règles sans leur compte de correspondances : c'est cette version
+    /// qu'utilisent les écritures, qui n'ont que faire du chiffre.
+    fn rules_raw(&self) -> Result<Vec<Rule>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, calendar_id, field, match_kind, pattern, case_sensitive,
+            "SELECT id, name, field, property, match_kind, pattern, case_sensitive,
                     category_id, rename_to, hide, priority, enabled
              FROM rules ORDER BY priority, rowid",
         )?;
@@ -603,8 +1009,8 @@ impl Store {
             Ok(Rule {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                calendar_id: row.get(2)?,
-                field: RuleField::from_str(&row.get::<_, String>(3)?),
+                field: RuleField::from_str(&row.get::<_, String>(2)?),
+                property: row.get(3)?,
                 match_kind: RuleMatch::from_str(&row.get::<_, String>(4)?),
                 pattern: row.get(5)?,
                 case_sensitive: row.get::<_, i64>(6)? != 0,
@@ -616,28 +1022,7 @@ impl Store {
                 match_count: 0,
             })
         })?;
-        let mut rules = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-
-        // Le compte de correspondances n'est pas stocké : il se déduit de l'état
-        // courant, et un chiffre périmé serait pire que pas de chiffre du tout.
-        let samples = self.rule_inputs()?;
-        for rule in &mut rules {
-            rule.match_count = samples
-                .iter()
-                .filter(|(calendar_id, title, location, description)| {
-                    rules::matches(
-                        rule,
-                        &rules::Fields {
-                            calendar_id,
-                            title,
-                            location,
-                            description,
-                        },
-                    )
-                })
-                .count() as u32;
-        }
-        Ok(rules)
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Enregistre une règle. Un identifiant vide en crée une nouvelle.
@@ -647,6 +1032,15 @@ impl Store {
                 "une règle a besoin d'un motif à reconnaître".into(),
             ));
         }
+        if rule.field == RuleField::Property
+            && rule.property.as_ref().is_none_or(|p| p.trim().is_empty())
+        {
+            return Err(TimewrapError::InvalidEvent(
+                "une règle sur un champ doit dire lequel".into(),
+            ));
+        }
+        let property = rule.property.as_ref().map(|p| properties::normalize(p));
+
         let id = if rule.id.trim().is_empty() {
             let id = new_id("rule", now_utc, &rule.pattern);
             let next: i64 = self.conn.query_row(
@@ -655,14 +1049,14 @@ impl Store {
                 |row| row.get(0),
             )?;
             self.conn.execute(
-                "INSERT INTO rules (id, name, calendar_id, field, match_kind, pattern,
+                "INSERT INTO rules (id, name, field, property, match_kind, pattern,
                                     case_sensitive, category_id, rename_to, hide, priority, enabled)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     id,
                     rule_name(rule),
-                    rule.calendar_id,
                     rule.field.as_str(),
+                    property,
                     rule.match_kind.as_str(),
                     rule.pattern.trim(),
                     rule.case_sensitive as i64,
@@ -676,15 +1070,15 @@ impl Store {
             id
         } else {
             let changed = self.conn.execute(
-                "UPDATE rules SET name = ?2, calendar_id = ?3, field = ?4, match_kind = ?5,
+                "UPDATE rules SET name = ?2, field = ?3, property = ?4, match_kind = ?5,
                                   pattern = ?6, case_sensitive = ?7, category_id = ?8,
                                   rename_to = ?9, hide = ?10, priority = ?11, enabled = ?12
                  WHERE id = ?1",
                 params![
                     rule.id,
                     rule_name(rule),
-                    rule.calendar_id,
                     rule.field.as_str(),
+                    property,
                     rule.match_kind.as_str(),
                     rule.pattern.trim(),
                     rule.case_sensitive as i64,
@@ -715,47 +1109,14 @@ impl Store {
         Ok(())
     }
 
-    /// Rejoue toutes les règles sur toutes les occurrences.
+    /// Rejoue toutes les règles sur toutes les séances.
     ///
     /// Renvoie le nombre de séances dont l'apparence a changé — c'est ce que
-    /// l'écran des règles affiche après une modification, pour que l'effet soit
-    /// visible immédiatement même hors de la fenêtre consultée.
+    /// l'écran des couleurs affiche, pour que l'effet soit visible même hors de
+    /// la fenêtre consultée.
     pub fn reapply_rules(&self) -> Result<u32> {
         let rules = self.rules_raw()?;
-
-        struct Row {
-            id: String,
-            calendar_id: String,
-            summary: String,
-            location: String,
-            description: String,
-            display_title: String,
-            category_id: Option<String>,
-            locked: bool,
-            hidden: bool,
-        }
-
-        let rows: Vec<Row> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, calendar_id, summary, location, description, display_title,
-                        category_id, category_locked, hidden
-                 FROM occurrences",
-            )?;
-            let mapped = stmt.query_map([], |row| {
-                Ok(Row {
-                    id: row.get(0)?,
-                    calendar_id: row.get(1)?,
-                    summary: row.get(2)?,
-                    location: row.get(3)?,
-                    description: row.get(4)?,
-                    display_title: row.get(5)?,
-                    category_id: row.get(6)?,
-                    locked: row.get::<_, i64>(7)? != 0,
-                    hidden: row.get::<_, i64>(8)? != 0,
-                })
-            })?;
-            mapped.collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let rows = self.rule_inputs()?;
 
         let mut touched = 0u32;
         self.transact(|| {
@@ -764,17 +1125,9 @@ impl Store {
                  WHERE id = ?1",
             )?;
             for row in &rows {
-                let outcome = rules::apply(
-                    &rules,
-                    &rules::Fields {
-                        calendar_id: &row.calendar_id,
-                        title: &row.summary,
-                        location: &row.location,
-                        description: &row.description,
-                    },
-                );
+                let outcome = rules::apply(&rules, &row.fields());
                 let display_title = outcome.display_title.unwrap_or_default();
-                // Une catégorie choisie à la main sur un événement l'emporte sur
+                // Une catégorie choisie à la main sur une séance l'emporte sur
                 // les règles : l'exception doit survivre au moteur.
                 let category_id = if row.locked {
                     row.category_id.clone()
@@ -802,64 +1155,47 @@ impl Store {
         Ok(touched)
     }
 
-    /// Les règles sans leur compte de correspondances : c'est cette version
-    /// qu'utilisent les écritures, qui n'ont que faire du chiffre.
-    fn rules_raw(&self) -> Result<Vec<Rule>> {
+    /// Toutes les séances, avec ce dont les règles ont besoin pour se prononcer.
+    fn rule_inputs(&self) -> Result<Vec<RuleInput>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, calendar_id, field, match_kind, pattern, case_sensitive,
-                    category_id, rename_to, hide, priority, enabled
-             FROM rules ORDER BY priority, rowid",
+            "SELECT o.id, o.summary, o.location, o.description, o.display_title,
+                    o.category_id, o.category_locked, o.hidden
+             FROM occurrences o",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(Rule {
+            Ok(RuleInput {
                 id: row.get(0)?,
-                name: row.get(1)?,
-                calendar_id: row.get(2)?,
-                field: RuleField::from_str(&row.get::<_, String>(3)?),
-                match_kind: RuleMatch::from_str(&row.get::<_, String>(4)?),
-                pattern: row.get(5)?,
-                case_sensitive: row.get::<_, i64>(6)? != 0,
-                category_id: row.get(7)?,
-                rename_to: row.get(8)?,
-                hide: row.get::<_, i64>(9)? != 0,
-                priority: row.get::<_, i64>(10)? as i32,
-                enabled: row.get::<_, i64>(11)? != 0,
-                match_count: 0,
+                summary: row.get(1)?,
+                location: row.get(2)?,
+                description: row.get(3)?,
+                display_title: row.get(4)?,
+                category_id: row.get(5)?,
+                locked: row.get::<_, i64>(6)? != 0,
+                hidden: row.get::<_, i64>(7)? != 0,
+                properties: Vec::new(),
             })
         })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
+        let mut inputs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
-    fn rule_inputs(&self) -> Result<Vec<(String, String, String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT calendar_id, summary, location, description FROM occurrences")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        // Les champs sont relus depuis la description plutôt que joints en SQL :
+        // une requête de moins, et le résultat est le même puisque c'est d'elle
+        // qu'ils viennent.
+        for input in &mut inputs {
+            input.properties = properties::parse(&input.description);
+        }
+        Ok(inputs)
     }
 
     /// Ce que le cœur propose de classer, au vu de ce qui a été importé.
-    pub fn rule_suggestions(&self, scope: &Scope) -> Result<Vec<RuleSuggestion>> {
-        let samples: Vec<rules::Sample> = {
-            let (clause, values) = match scope {
-                Some(ids) if !ids.is_empty() => {
-                    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                    (
-                        format!("WHERE calendar_id IN ({placeholders})"),
-                        ids.iter().map(|id| Value::Text(id.clone())).collect(),
-                    )
-                }
-                _ => (String::new(), Vec::<Value>::new()),
-            };
-            let sql = format!("SELECT summary FROM occurrences {clause}");
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(values), |row| {
-                Ok(rules::Sample { title: row.get(0)? })
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
+    pub fn rule_suggestions(&self) -> Result<Vec<RuleSuggestion>> {
+        let samples: Vec<rules::Sample> = self
+            .rule_inputs()?
+            .into_iter()
+            .map(|input| rules::Sample {
+                title: input.summary,
+                properties: input.properties,
+            })
+            .collect();
 
         let existing = self.rules_raw()?;
         let used: Vec<u32> = self.categories()?.into_iter().map(|c| c.color).collect();
@@ -892,8 +1228,8 @@ impl Store {
             &Rule {
                 id: String::new(),
                 name: name.trim().to_string(),
-                calendar_id: None,
                 field: suggestion.field,
+                property: suggestion.property.clone(),
                 match_kind: suggestion.match_kind,
                 pattern: suggestion.pattern.clone(),
                 case_sensitive: false,
@@ -908,38 +1244,33 @@ impl Store {
         )
     }
 
-    // ------------------------------------------------------ événements locaux
+    // ------------------------------------------------------ événements saisis
 
     /// Écrit un événement, en traitant les chevauchements selon `resolution`.
-    ///
-    /// C'est le point de passage unique : toute création ou modification d'un
-    /// créneau passe par ici, donc aucune ne peut échapper au contrôle.
     pub fn save_event(
         &self,
         draft: &EventDraft,
         resolution: Resolution,
         now_utc: i64,
     ) -> Result<SaveOutcome> {
-        self.require_calendar(&draft.calendar_id)?;
+        let calendar_id = self.timetable_id()?;
         if draft.end_utc <= draft.start_utc {
             return Err(TimewrapError::InvalidEvent(
                 "un événement doit finir après avoir commencé".into(),
             ));
         }
-        if let Some(id) = &draft.id {
-            let origin = self.occurrence_origin(id)?;
-            if origin != EventOrigin::Local {
-                return Err(TimewrapError::InvalidEvent(
-                    "une séance importée ne se modifie pas ici : elle serait écrasée au prochain import".into(),
-                ));
-            }
+        if let Some(id) = &draft.id
+            && self.occurrence_origin(id)? != EventOrigin::Local
+        {
+            return Err(TimewrapError::InvalidEvent(
+                "une séance importée ne se modifie pas ici : elle serait écrasée au prochain import".into(),
+            ));
         }
 
         let duration = draft.end_utc - draft.start_utc;
         let mut start = draft.start_utc;
         let mut end = draft.end_utc;
-        let mut conflicts =
-            self.conflicts_for(draft.id.as_deref(), &draft.calendar_id, start, end)?;
+        let mut conflicts = self.conflicts_for(draft.id.as_deref(), start, end)?;
         let mut shifted_minutes = 0i64;
         let mut removed = 0u32;
         let mut hidden = 0u32;
@@ -971,12 +1302,7 @@ impl Store {
                         };
                         start = target;
                         end = target + duration;
-                        conflicts = self.conflicts_for(
-                            draft.id.as_deref(),
-                            &draft.calendar_id,
-                            start,
-                            end,
-                        )?;
+                        conflicts = self.conflicts_for(draft.id.as_deref(), start, end)?;
                         if conflicts.is_empty() {
                             break;
                         }
@@ -1010,14 +1336,15 @@ impl Store {
             title
         };
 
+        let props = properties::parse(&draft.description);
         let rules = self.rules_raw()?;
         let outcome = rules::apply(
             &rules,
             &rules::Fields {
-                calendar_id: &draft.calendar_id,
                 title,
                 location: &draft.location,
                 description: &draft.description,
+                properties: &props,
             },
         );
         let locked = draft.category_id.is_some();
@@ -1030,7 +1357,6 @@ impl Store {
               hidden, muted)
              VALUES (?1, ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, 0)
              ON CONFLICT(id) DO UPDATE SET
-                 calendar_id = excluded.calendar_id,
                  summary = excluded.summary,
                  location = excluded.location,
                  description = excluded.description,
@@ -1043,7 +1369,7 @@ impl Store {
                  hidden = excluded.hidden",
             params![
                 id,
-                draft.calendar_id,
+                calendar_id,
                 title,
                 draft.location.trim(),
                 draft.description.trim(),
@@ -1057,6 +1383,7 @@ impl Store {
                 outcome.hidden as i64,
             ],
         )?;
+        self.write_properties(&id, &props)?;
 
         Ok(SaveOutcome {
             saved: Some(self.occurrence(&id)?),
@@ -1068,7 +1395,8 @@ impl Store {
         })
     }
 
-    /// Fait place nette : supprime ce qui est local, masque ce qui est importé.
+    /// Fait place nette : supprime ce qui a été saisi ici, masque ce qui est
+    /// importé.
     fn clear_conflicts(&self, conflicts: &[Conflict]) -> Result<(u32, u32)> {
         let mut removed = 0;
         let mut hidden = 0;
@@ -1096,7 +1424,7 @@ impl Store {
     pub fn delete_event(&self, id: &str) -> Result<()> {
         if self.occurrence_origin(id)? != EventOrigin::Local {
             return Err(TimewrapError::InvalidEvent(
-                "une séance importée ne se supprime pas : masquez-la ou retirez son agenda".into(),
+                "une séance importée ne se supprime pas : masquez-la".into(),
             ));
         }
         self.conn
@@ -1104,7 +1432,7 @@ impl Store {
         Ok(())
     }
 
-    /// Masque ou réaffiche une séance précise, sans toucher à son agenda.
+    /// Masque ou réaffiche une séance précise.
     pub fn set_muted(&self, id: &str, muted: bool) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE occurrences SET muted = ?2 WHERE id = ?1",
@@ -1157,14 +1485,9 @@ impl Store {
     // -------------------------------------------------------------- conflits
 
     /// Chevauchements d'un projet d'événement avec l'existant.
-    ///
-    /// La visibilité des agendas est ignorée à dessein : un agenda décoché reste
-    /// un engagement pris, et poser un rendez-vous dessus sans être prévenu
-    /// serait le meilleur moyen de le découvrir trop tard.
     pub fn conflicts_for(
         &self,
         draft_id: Option<&str>,
-        calendar_id: &str,
         start_utc: i64,
         end_utc: i64,
     ) -> Result<Vec<Conflict>> {
@@ -1172,7 +1495,6 @@ impl Store {
         let candidates = self.raw_occurrences(start_utc - window, end_utc + window)?;
         Ok(conflict::against_draft(
             draft_id,
-            calendar_id,
             start_utc,
             end_utc,
             &candidates,
@@ -1180,40 +1502,10 @@ impl Store {
     }
 
     /// Tous les chevauchements déjà présents sur une fenêtre.
-    pub fn conflicts_between(
-        &self,
-        from_utc: i64,
-        to_utc: i64,
-        scope: &Scope,
-    ) -> Result<Vec<ConflictPair>> {
-        let occurrences = match scope {
-            Some(ids) if !ids.is_empty() => self
-                .raw_occurrences(from_utc, to_utc)?
-                .into_iter()
-                .filter(|o| ids.contains(&o.calendar_id))
-                .collect(),
-            _ => self.raw_occurrences(from_utc, to_utc)?,
-        };
-        Ok(conflict::pairs(&occurrences))
+    pub fn conflicts_between(&self, from_utc: i64, to_utc: i64) -> Result<Vec<ConflictPair>> {
+        Ok(conflict::pairs(&self.raw_occurrences(from_utc, to_utc)?))
     }
 
-    /// Les séances écartées à la main, pour pouvoir les faire revenir.
-    ///
-    /// Sans cette liste, « Remplacer » serait sans retour : la séance masquée
-    /// disparaîtrait des vues comme du gestionnaire de conflits, donc de partout.
-    pub fn muted_between(&self, from_utc: i64, to_utc: i64) -> Result<Vec<Occurrence>> {
-        let sql = format!(
-            "SELECT {OCC_COLUMNS} {OCC_FROM}
-             WHERE o.muted = 1 AND o.end_utc > ?1 AND o.start_utc < ?2
-             ORDER BY o.start_utc"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![from_utc, to_utc], read_occurrence)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// Occurrences d'une fenêtre, visibilité des agendas ignorée : c'est la
-    /// matière première du moteur de conflits, qui doit tout voir.
     fn raw_occurrences(&self, from_utc: i64, to_utc: i64) -> Result<Vec<Occurrence>> {
         let sql = format!(
             "SELECT {OCC_COLUMNS} {OCC_FROM}
@@ -1225,90 +1517,84 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    // --------------------------------------------------------------- requêtes
-
-    /// Occurrences chevauchant `[from_utc, to_utc)`.
-    pub fn occurrences_between(
-        &self,
-        from_utc: i64,
-        to_utc: i64,
-        scope: &Scope,
-    ) -> Result<Vec<Occurrence>> {
-        let (clause, mut values) = scope_clause(scope);
+    /// Les séances écartées à la main, pour pouvoir les faire revenir.
+    pub fn muted_between(&self, from_utc: i64, to_utc: i64) -> Result<Vec<Occurrence>> {
         let sql = format!(
             "SELECT {OCC_COLUMNS} {OCC_FROM}
-             WHERE {clause} AND o.hidden = 0 AND o.muted = 0
-                   AND o.end_utc > ? AND o.start_utc < ?
-             ORDER BY o.all_day DESC, o.start_utc, o.summary"
+             WHERE o.muted = 1 AND o.end_utc > ?1 AND o.start_utc < ?2
+             ORDER BY o.start_utc"
         );
-        values.push(Value::Integer(from_utc));
-        values.push(Value::Integer(to_utc));
-
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(values), read_occurrence)?;
+        let rows = stmt.query_map(params![from_utc, to_utc], read_occurrence)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Contenu d'une journée, `epoch_day` étant compté comme `LocalDate.toEpochDay()`.
-    pub fn day(&self, epoch_day: i64, scope: &Scope) -> Result<DayAgenda> {
+    // --------------------------------------------------------------- requêtes
+
+    pub fn occurrences_between(&self, from_utc: i64, to_utc: i64) -> Result<Vec<Occurrence>> {
+        let sql = format!(
+            "SELECT {OCC_COLUMNS} {OCC_FROM}
+             WHERE {VISIBLE} AND o.end_utc > ?1 AND o.start_utc < ?2
+             ORDER BY o.all_day DESC, o.start_utc, o.summary"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from_utc, to_utc], read_occurrence)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Contenu d'une journée : les séances, et ce qu'il reste à y faire.
+    pub fn day(&self, epoch_day: i64, now_utc: i64) -> Result<DayAgenda> {
         let (from, to) = self.day_bounds(epoch_day)?;
         let all_day_from = epoch_day * 86_400;
         let all_day_to = all_day_from + 86_400;
 
-        let (clause, mut values) = scope_clause(scope);
         let sql = format!(
             "SELECT {OCC_COLUMNS} {OCC_FROM}
-             WHERE {clause} AND o.hidden = 0 AND o.muted = 0 AND (
-                 (o.all_day = 0 AND o.end_utc > ? AND o.start_utc < ?)
-                 OR (o.all_day = 1 AND o.start_utc >= ? AND o.start_utc < ?)
+             WHERE {VISIBLE} AND (
+                 (o.all_day = 0 AND o.end_utc > ?1 AND o.start_utc < ?2)
+                 OR (o.all_day = 1 AND o.start_utc >= ?3 AND o.start_utc < ?4)
              )
              ORDER BY o.all_day DESC, o.start_utc, o.summary"
         );
-        values.extend([
-            Value::Integer(from),
-            Value::Integer(to),
-            Value::Integer(all_day_from),
-            Value::Integer(all_day_to),
-        ]);
-
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(values), read_occurrence)?;
+        let rows = stmt.query_map(params![from, to, all_day_from, all_day_to], read_occurrence)?;
+
         Ok(DayAgenda {
             epoch_day,
             occurrences: rows.collect::<std::result::Result<Vec<_>, _>>()?,
+            tasks: self.tasks_for_day(epoch_day, self.epoch_day_of(now_utc)?)?,
         })
     }
 
-    /// `days` journées consécutives à partir de `epoch_day`.
-    pub fn days(&self, epoch_day: i64, days: u32, scope: &Scope) -> Result<Vec<DayAgenda>> {
+    pub fn days(&self, epoch_day: i64, days: u32, now_utc: i64) -> Result<Vec<DayAgenda>> {
         (0..days as i64)
-            .map(|offset| self.day(epoch_day + offset, scope))
+            .map(|offset| self.day(epoch_day + offset, now_utc))
             .collect()
     }
 
     /// Ce qui se passe maintenant, et ce qui vient après.
-    pub fn now_view(&self, now_utc: i64, scope: &Scope) -> Result<NowView> {
+    pub fn now_view(&self, now_utc: i64) -> Result<NowView> {
         let current = self.query_one(
             "o.all_day = 0 AND o.cancelled = 0 AND o.start_utc <= ? AND o.end_utc > ?",
             "ORDER BY o.start_utc DESC",
             now_utc,
-            scope,
         )?;
 
         let next = self.query_one(
             "o.all_day = 0 AND o.cancelled = 0 AND o.start_utc > ?",
             "ORDER BY o.start_utc",
             now_utc,
-            scope,
         )?;
 
         let today = self.epoch_day_of(now_utc)?;
-        let rest_of_day = self
-            .day(today, scope)?
+        let day = self.day(today, now_utc)?;
+        let rest_of_day = day
             .occurrences
             .into_iter()
             .filter(|o| o.start_utc > now_utc)
             .collect();
+
+        let pending: Vec<&Task> = day.tasks.iter().filter(|t| !t.done).collect();
 
         Ok(NowView {
             minutes_remaining: current
@@ -1320,63 +1606,240 @@ impl Store {
             current,
             next,
             rest_of_day,
+            pending_tasks: pending.len() as u32,
+            late_tasks: pending.iter().filter(|t| t.days_late > 0).count() as u32,
         })
     }
 
-    fn query_one(
-        &self,
-        filter: &str,
-        order: &str,
-        now_utc: i64,
-        scope: &Scope,
-    ) -> Result<Option<Occurrence>> {
-        let (clause, mut values) = scope_clause(scope);
+    fn query_one(&self, filter: &str, order: &str, now_utc: i64) -> Result<Option<Occurrence>> {
         let sql = format!(
             "SELECT {OCC_COLUMNS} {OCC_FROM}
-             WHERE {clause} AND o.hidden = 0 AND o.muted = 0 AND {filter}
+             WHERE {VISIBLE} AND {filter}
              {order} LIMIT 1"
         );
         // Le filtre porte une ou deux fois l'instant courant selon qu'il teste
         // un intervalle ou une borne : on compte les marqueurs plutôt que de
         // maintenir deux variantes de la requête.
-        for _ in 0..filter.matches('?').count() {
-            values.push(Value::Integer(now_utc));
-        }
+        let values: Vec<i64> = std::iter::repeat_n(now_utc, filter.matches('?').count()).collect();
         Ok(self
             .conn
-            .query_row(&sql, params_from_iter(values), read_occurrence)
+            .query_row(&sql, rusqlite::params_from_iter(values), read_occurrence)
             .optional()?)
     }
 
-    /// De quoi peupler l'écran d'accueil : une tuile par agenda.
-    pub fn calendar_summaries(&self, now_utc: i64) -> Result<Vec<CalendarSummary>> {
-        let week_end = now_utc + Duration::days(7).num_seconds();
-        let lookahead = now_utc + CONFLICT_LOOKAHEAD.num_seconds();
+    // -------------------------------------------------------- choses à faire
 
-        self.calendars()?
+    /// Les tâches qui concernent une journée.
+    ///
+    /// Une tâche non cochée reste due : consultée aujourd'hui, la liste montre
+    /// donc tout ce qui traîne depuis les jours précédents, avec son retard. Un
+    /// jour passé ou à venir, en revanche, ne montre que ce qui lui était propre
+    /// — sans quoi la vue Semaine répéterait sept fois la même chose.
+    pub fn tasks_for_day(&self, epoch_day: i64, today: i64) -> Result<Vec<Task>> {
+        let sql = if epoch_day == today {
+            "SELECT id, title, notes, planned_day, done, done_day, position
+             FROM tasks
+             WHERE (done = 0 AND planned_day <= ?1) OR done_day = ?1
+             ORDER BY done, planned_day, position, rowid"
+        } else {
+            "SELECT id, title, notes, planned_day, done, done_day, position
+             FROM tasks
+             WHERE planned_day = ?1 OR done_day = ?1
+             ORDER BY done, planned_day, position, rowid"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![epoch_day], |row| read_task(row, epoch_day))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Tout ce qui reste ouvert, du plus ancien au plus récent.
+    pub fn pending_tasks(&self, today: i64) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, notes, planned_day, done, done_day, position
+             FROM tasks WHERE done = 0 AND planned_day <= ?1
+             ORDER BY planned_day, position, rowid",
+        )?;
+        let rows = stmt.query_map(params![today], |row| read_task(row, today))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn add_task(&self, title: &str, planned_day: i64, now_utc: i64) -> Result<Task> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(TimewrapError::InvalidEvent(
+                "une tâche a besoin d'un intitulé".into(),
+            ));
+        }
+        let position: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM tasks WHERE planned_day = ?1",
+            params![planned_day],
+            |row| row.get(0),
+        )?;
+        let id = new_id("task", now_utc, title);
+        self.conn.execute(
+            "INSERT INTO tasks (id, title, notes, planned_day, done, created_at, position)
+             VALUES (?1, ?2, '', ?3, 0, ?4, ?5)",
+            params![id, title, planned_day, now_utc, position],
+        )?;
+        self.task(&id, planned_day)
+    }
+
+    pub fn set_task_done(&self, id: &str, done: bool, today: i64) -> Result<Task> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET done = ?2, done_day = ?3 WHERE id = ?1",
+            params![id, done as i64, if done { Some(today) } else { None }],
+        )?;
+        if changed == 0 {
+            return Err(TimewrapError::NotFound(format!("tâche {id}")));
+        }
+        self.task(id, today)
+    }
+
+    pub fn update_task(&self, id: &str, title: &str, notes: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(TimewrapError::InvalidEvent(
+                "une tâche a besoin d'un intitulé".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE tasks SET title = ?2, notes = ?3 WHERE id = ?1",
+            params![id, title, notes.trim()],
+        )?;
+        if changed == 0 {
+            return Err(TimewrapError::NotFound(format!("tâche {id}")));
+        }
+        Ok(())
+    }
+
+    /// Repousse une tâche à un autre jour, explicitement.
+    pub fn move_task(&self, id: &str, planned_day: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET planned_day = ?2 WHERE id = ?1",
+            params![id, planned_day],
+        )?;
+        if changed == 0 {
+            return Err(TimewrapError::NotFound(format!("tâche {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn delete_task(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    fn task(&self, id: &str, reference_day: i64) -> Result<Task> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, notes, planned_day, done, done_day, position
+             FROM tasks WHERE id = ?1",
+        )?;
+        stmt.query_row(params![id], |row| read_task(row, reference_day))
+            .optional()?
+            .ok_or_else(|| TimewrapError::NotFound(format!("tâche {id}")))
+    }
+
+    // ----------------------------------------------------------------- rappels
+
+    /// Les rappels à programmer, du plus proche au plus lointain.
+    ///
+    /// Le cœur décide de l'instant, l'application se contente de poser les
+    /// alarmes : la règle « quinze minutes avant, sauf séance annulée ou
+    /// masquée » n'a aucune raison de vivre dans du Kotlin.
+    pub fn reminders(&self, now_utc: i64, horizon_days: i64, limit: u32) -> Result<Vec<Reminder>> {
+        let settings = self.settings()?;
+        if !settings.reminders_enabled {
+            return Ok(Vec::new());
+        }
+        let lead = settings.reminder_lead_minutes as i64 * 60;
+        let to = now_utc + horizon_days * 86_400;
+
+        Ok(self
+            .occurrences_between(now_utc, to)?
             .into_iter()
-            .map(|calendar| {
-                let scope = Some(vec![calendar.id.clone()]);
-                let upcoming_week = self
-                    .occurrences_between(now_utc, week_end, &scope)?
-                    .into_iter()
-                    .filter(|o| !o.cancelled)
-                    .count() as u32;
-                let next = self.query_one(
-                    "o.all_day = 0 AND o.cancelled = 0 AND o.start_utc > ?",
-                    "ORDER BY o.start_utc",
-                    now_utc,
-                    &scope,
-                )?;
-                let conflicts = self.conflicts_between(now_utc, lookahead, &scope)?.len() as u32;
-                Ok(CalendarSummary {
-                    calendar,
-                    upcoming_week,
-                    next,
-                    conflicts,
-                })
+            .filter(|o| !o.all_day && !o.cancelled && o.start_utc > now_utc)
+            .map(|o| Reminder {
+                occurrence_id: o.id,
+                title: o.title,
+                location: o.location,
+                start_utc: o.start_utc,
+                trigger_utc: o.start_utc - lead,
             })
-            .collect()
+            .filter(|r| r.trigger_utc > now_utc)
+            .take(limit as usize)
+            .collect())
+    }
+
+    // --------------------------------------------------------------- réglages
+
+    pub fn settings(&self) -> Result<Settings> {
+        Ok(Settings {
+            source_url: self.get_setting("source_url")?.unwrap_or_default(),
+            sync_enabled: self.flag("sync_enabled", false)?,
+            sync_interval_hours: self.number("sync_interval_hours", 6)?,
+            last_sync_utc: self
+                .get_setting("last_sync_utc")?
+                .and_then(|v| v.parse().ok()),
+            notify_changes: self.flag("notify_changes", true)?,
+            reminders_enabled: self.flag("reminders_enabled", false)?,
+            reminder_lead_minutes: self.number("reminder_lead_minutes", 15)?,
+            digest_enabled: self.flag("digest_enabled", false)?,
+            digest_minutes: self.number("digest_minutes", 7 * 60)?,
+        })
+    }
+
+    pub fn update_settings(&self, settings: &Settings) -> Result<Settings> {
+        self.set_setting("source_url", settings.source_url.trim())?;
+        self.set_setting("sync_enabled", bool_str(settings.sync_enabled))?;
+        self.set_setting(
+            "sync_interval_hours",
+            &settings.sync_interval_hours.clamp(1, 168).to_string(),
+        )?;
+        self.set_setting("notify_changes", bool_str(settings.notify_changes))?;
+        self.set_setting("reminders_enabled", bool_str(settings.reminders_enabled))?;
+        self.set_setting(
+            "reminder_lead_minutes",
+            &settings.reminder_lead_minutes.clamp(0, 240).to_string(),
+        )?;
+        self.set_setting("digest_enabled", bool_str(settings.digest_enabled))?;
+        self.set_setting(
+            "digest_minutes",
+            &settings.digest_minutes.min(24 * 60 - 1).to_string(),
+        )?;
+        self.settings()
+    }
+
+    fn flag(&self, key: &str, default: bool) -> Result<bool> {
+        Ok(self.get_setting(key)?.map(|v| v == "1").unwrap_or(default))
+    }
+
+    fn number(&self, key: &str, default: u32) -> Result<u32> {
+        Ok(self
+            .get_setting(key)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default))
+    }
+
+    fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------- fuseaux
@@ -1405,7 +1868,7 @@ impl Store {
         Ok(dt.with_timezone(&Utc).timestamp())
     }
 
-    fn epoch_day_of(&self, utc: i64) -> Result<i64> {
+    pub fn epoch_day_of(&self, utc: i64) -> Result<i64> {
         let dt = DateTime::from_timestamp(utc, 0)
             .ok_or_else(|| TimewrapError::Parse(format!("horodatage hors limites : {utc}")))?;
         let date = dt.with_timezone(&self.tz).date_naive();
@@ -1413,90 +1876,99 @@ impl Store {
             .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
             .num_days())
     }
+}
 
-    // --------------------------------------------------------------- réglages
+/// Une séance telle que la comparaison entre deux imports la retient.
+struct Snapshot {
+    uid: String,
+    title: String,
+    location: String,
+    start_utc: i64,
+    cancelled: bool,
+}
 
-    fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?)
+impl Snapshot {
+    /// Même série, même créneau : c'est la même séance.
+    fn same_slot(&self, other: &Snapshot) -> bool {
+        self.uid == other.uid && self.start_utc == other.start_utc
     }
 
-    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
-    }
-
-    fn require_calendar(&self, calendar_id: &str) -> Result<()> {
-        let exists: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM calendars WHERE id = ?1",
-            params![calendar_id],
-            |row| row.get(0),
-        )?;
-        if exists == 0 {
-            return Err(TimewrapError::CalendarNotFound(calendar_id.to_string()));
-        }
-        Ok(())
+    /// Vrai si cette séance retrouve son exact équivalent dans une liste.
+    fn matched(&self, others: &[Snapshot]) -> bool {
+        others.iter().any(|o| o.same_slot(self))
     }
 }
 
-/// Clause de portée d'une vue, et les valeurs à lier avec elle.
-fn scope_clause(scope: &Scope) -> (String, Vec<Value>) {
-    match scope {
-        Some(ids) if !ids.is_empty() => {
-            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            (
-                format!("o.calendar_id IN ({placeholders})"),
-                ids.iter().map(|id| Value::Text(id.clone())).collect(),
-            )
-        }
-        _ => ("c.visible = 1".to_string(), Vec::new()),
+fn change(kind: ChangeKind, snapshot: &Snapshot, summary: String) -> Change {
+    Change {
+        kind,
+        title: snapshot.title.clone(),
+        summary,
+        start_utc: snapshot.start_utc,
     }
 }
 
-fn read_calendar(row: &rusqlite::Row<'_>) -> rusqlite::Result<Calendar> {
-    Ok(Calendar {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        kind: CalendarKind::from_str(&row.get::<_, String>(2)?),
-        source: row.get(3)?,
-        color: row.get::<_, i64>(4)? as u32,
-        visible: row.get::<_, i64>(5)? != 0,
-        last_sync: row.get(6)?,
-        event_count: row.get::<_, i64>(7)? as u32,
-        position: row.get::<_, i64>(8)? as i32,
-    })
+/// Une séance et ce dont les règles ont besoin pour se prononcer sur elle.
+struct RuleInput {
+    id: String,
+    summary: String,
+    location: String,
+    description: String,
+    display_title: String,
+    category_id: Option<String>,
+    locked: bool,
+    hidden: bool,
+    properties: Vec<Property>,
+}
+
+impl RuleInput {
+    fn fields(&self) -> rules::Fields<'_> {
+        rules::Fields {
+            title: &self.summary,
+            location: &self.location,
+            description: &self.description,
+            properties: &self.properties,
+        }
+    }
 }
 
 fn read_occurrence(row: &rusqlite::Row<'_>) -> rusqlite::Result<Occurrence> {
     Ok(Occurrence {
         id: row.get(0)?,
-        calendar_id: row.get(1)?,
-        calendar_name: row.get(2)?,
-        color: row.get::<_, i64>(3)? as u32,
-        uid: row.get(4)?,
-        title: row.get(5)?,
-        raw_title: row.get(6)?,
-        location: row.get(7)?,
-        description: row.get(8)?,
-        start_utc: row.get(9)?,
-        end_utc: row.get(10)?,
-        all_day: row.get::<_, i64>(11)? != 0,
-        cancelled: row.get::<_, i64>(12)? != 0,
-        origin: EventOrigin::from_str(&row.get::<_, String>(13)?),
-        category_id: row.get(14)?,
-        category_name: row.get(15)?,
-        category_label: row.get(16)?,
-        hidden: row.get::<_, i64>(17)? != 0,
+        color: row.get::<_, i64>(1)? as u32,
+        uid: row.get(2)?,
+        title: row.get(3)?,
+        raw_title: row.get(4)?,
+        location: row.get(5)?,
+        description: row.get(6)?,
+        start_utc: row.get(7)?,
+        end_utc: row.get(8)?,
+        all_day: row.get::<_, i64>(9)? != 0,
+        cancelled: row.get::<_, i64>(10)? != 0,
+        origin: EventOrigin::from_str(&row.get::<_, String>(11)?),
+        category_id: row.get(12)?,
+        category_name: row.get(13)?,
+        category_label: row.get(14)?,
+        hidden: row.get::<_, i64>(15)? != 0,
+    })
+}
+
+fn read_task(row: &rusqlite::Row<'_>, reference_day: i64) -> rusqlite::Result<Task> {
+    let planned_day: i64 = row.get(3)?;
+    let done: bool = row.get::<_, i64>(4)? != 0;
+    Ok(Task {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        notes: row.get(2)?,
+        planned_day,
+        done,
+        done_day: row.get(5)?,
+        days_late: if done {
+            0
+        } else {
+            (reference_day - planned_day).max(0)
+        },
+        position: row.get::<_, i64>(6)? as i32,
     })
 }
 
@@ -1509,8 +1981,29 @@ fn rule_name(rule: &Rule) -> String {
     }
 }
 
-/// Identifiant stable : même agenda, même UID, même début, même identifiant.
-/// C'est ce qui permet aux personnalisations de survivre à un réimport de l'ENT.
+/// Une pastille tient en quatre caractères : on prend les initiales des mots,
+/// ou le début du mot unique.
+fn short_label(value: &str) -> String {
+    let words: Vec<&str> = value.split_whitespace().collect();
+    if words.len() >= 2 {
+        words
+            .iter()
+            .take(3)
+            .filter_map(|w| w.chars().next())
+            .collect::<String>()
+            .to_uppercase()
+    } else {
+        value.chars().take(4).collect::<String>().to_uppercase()
+    }
+}
+
+fn bool_str(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
+}
+
+/// Identifiant stable : même emploi du temps, même UID, même début, même
+/// identifiant. C'est ce qui permet aux personnalisations de survivre à un
+/// réimport de l'ENT.
 fn occurrence_id(calendar_id: &str, uid: &str, start_utc: i64) -> String {
     format!("{calendar_id}|{uid}|{start_utc}")
 }
@@ -1533,6 +2026,35 @@ fn epoch_day_to_date(epoch_day: i64) -> Result<NaiveDate> {
     NaiveDate::from_ymd_opt(1970, 1, 1)
         .and_then(|epoch| epoch.checked_add_signed(Duration::days(epoch_day)))
         .ok_or_else(|| TimewrapError::Parse(format!("jour hors limites : {epoch_day}")))
+}
+
+fn weekday_name(index: u32) -> &'static str {
+    match index {
+        0 => "lundi",
+        1 => "mardi",
+        2 => "mercredi",
+        3 => "jeudi",
+        4 => "vendredi",
+        5 => "samedi",
+        _ => "dimanche",
+    }
+}
+
+fn month_name(month: u32) -> &'static str {
+    match month {
+        1 => "janvier",
+        2 => "février",
+        3 => "mars",
+        4 => "avril",
+        5 => "mai",
+        6 => "juin",
+        7 => "juillet",
+        8 => "août",
+        9 => "septembre",
+        10 => "octobre",
+        11 => "novembre",
+        _ => "décembre",
+    }
 }
 
 fn parse_tz(name: &str) -> Result<Tz> {

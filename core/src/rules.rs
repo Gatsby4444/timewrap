@@ -1,42 +1,61 @@
 //! Le moteur de règles visuelles.
 //!
-//! Un emploi du temps d'ENT arrive avec des intitulés bruts — « CM - Algèbre
-//! linéaire (Amphi B) » — et rien qui distingue un amphi d'un TP. Plutôt que de
-//! recolorier chaque séance à la main, on décrit une fois la règle qui les
-//! reconnaît, et le cœur la rejoue sur tout ce qui entre.
+//! Un emploi du temps d'ENT arrive avec des intitulés bruts — « R3.01 DEV WEB -
+//! CM (Gr A) » — mais aussi, dans sa description, avec les champs qui comptent
+//! vraiment : « Type : Cours magistral », « Matière : Développement web ». Ce
+//! sont eux que le moteur privilégie, parce qu'ils disent explicitement ce que
+//! l'intitulé ne fait que suggérer.
 //!
-//! Le module est volontairement sans état ni base de données : il décide, le
-//! stockage écrit. C'est ce qui le rend testable ligne à ligne.
+//! Une règle relie une condition à trois effets cumulables : poser une
+//! catégorie — donc une couleur —, renommer, masquer. Le module est sans état
+//! ni base de données : il décide, le stockage écrit.
 
 use std::collections::HashMap;
 
 use crate::model::{Rule, RuleField, RuleMatch, RuleOutcome, RuleSuggestion};
+use crate::properties::{self, Property};
 
-/// Les champs d'une occurrence soumis aux règles.
+/// Les champs d'une séance soumis aux règles.
 #[derive(Debug, Clone, Copy)]
 pub struct Fields<'a> {
-    pub calendar_id: &'a str,
     pub title: &'a str,
     pub location: &'a str,
     pub description: &'a str,
+    /// Champs structurés lus dans la description.
+    pub properties: &'a [Property],
 }
 
-/// Vrai si la règle reconnaît cette occurrence.
+impl Fields<'_> {
+    fn property(&self, key: &str) -> Option<&str> {
+        self.properties
+            .iter()
+            .find(|p| p.key == key)
+            .map(|p| p.value.as_str())
+    }
+}
+
+/// Vrai si la règle reconnaît cette séance.
 pub fn matches(rule: &Rule, fields: &Fields<'_>) -> bool {
     if !rule.enabled || rule.pattern.trim().is_empty() {
         return false;
     }
-    if let Some(scope) = &rule.calendar_id
-        && scope != fields.calendar_id
-    {
-        return false;
-    }
 
+    let owned;
     let haystacks: &[&str] = match rule.field {
         RuleField::Title => &[fields.title],
         RuleField::Location => &[fields.location],
         RuleField::Description => &[fields.description],
         RuleField::Any => &[fields.title, fields.location, fields.description],
+        RuleField::Property => {
+            let Some(key) = &rule.property else {
+                return false;
+            };
+            let Some(value) = fields.property(&properties::normalize(key)) else {
+                return false;
+            };
+            owned = [value];
+            &owned
+        }
     };
 
     haystacks
@@ -69,7 +88,7 @@ pub fn tokenize(text: &str) -> impl Iterator<Item = &str> {
         .filter(|token| !token.is_empty())
 }
 
-/// Rejoue toutes les règles sur une occurrence et retient la décision finale.
+/// Rejoue toutes les règles sur une séance et retient la décision finale.
 ///
 /// L'ordre est celui de `priority` croissante ; chaque règle n'écrase que ce
 /// qu'elle renseigne, si bien qu'une règle de couleur et une règle de masquage
@@ -107,16 +126,20 @@ fn render_title(template: &str, original: &str) -> String {
     }
 }
 
-/// Un titre observé dans les données, matière première des suggestions.
+/// Une séance observée, matière première des suggestions.
 #[derive(Debug, Clone)]
 pub struct Sample {
     pub title: String,
+    pub properties: Vec<Property>,
 }
 
-/// Combien d'occurrences au minimum pour qu'un motif mérite une règle.
+/// Combien de séances au minimum pour qu'un motif mérite une règle.
 const MIN_OCCURRENCES: usize = 2;
 /// Au-delà, la liste devient un mur : on garde les motifs les plus porteurs.
 const MAX_SUGGESTIONS: usize = 12;
+/// Un champ à trop de valeurs distinctes ne se colorie pas : on ne distingue
+/// pas quinze couleurs d'un coup d'œil.
+const MAX_DISTINCT_VALUES: usize = 12;
 
 /// Mots qui reviennent partout sans rien classer.
 const STOP_WORDS: [&str; 23] = [
@@ -143,20 +166,107 @@ const KNOWN_TYPES: [(&str, &str); 13] = [
 
 /// Déduit des règles plausibles de ce qui a été importé.
 ///
-/// La logique tient en une phrase : un mot qui revient dans plusieurs séances
-/// mais pas dans toutes découpe l'emploi du temps, donc mérite une couleur. Les
-/// motifs déjà couverts par une règle existante sont écartés — proposer deux
-/// fois la même chose ferait perdre confiance dans la liste.
+/// Les champs structurés passent avant tout : « Type : TD » dit ce qu'il est,
+/// là où un mot d'intitulé ne fait que le laisser deviner. Ce n'est qu'à défaut
+/// — un export qui ne renseigne rien — qu'on retombe sur l'analyse des titres.
 pub fn suggest(samples: &[Sample], existing: &[Rule], palette: &[u32]) -> Vec<RuleSuggestion> {
     if samples.is_empty() {
         return Vec::new();
     }
 
-    let covered: Vec<String> = existing
-        .iter()
-        .map(|rule| rule.pattern.trim().to_lowercase())
-        .collect();
+    let from_properties = suggest_from_properties(samples, existing, palette);
+    if !from_properties.is_empty() {
+        return from_properties;
+    }
+    suggest_from_titles(samples, existing, palette)
+}
 
+/// Une valeur de champ structuré, et ce qu'on sait d'elle.
+struct ValueStat {
+    label: String,
+    value: String,
+    count: usize,
+    samples: Vec<String>,
+}
+
+fn suggest_from_properties(
+    samples: &[Sample],
+    existing: &[Rule],
+    palette: &[u32],
+) -> Vec<RuleSuggestion> {
+    // key -> (valeur normalisée -> statistiques)
+    let mut by_key: HashMap<String, HashMap<String, ValueStat>> = HashMap::new();
+
+    for sample in samples {
+        for property in &sample.properties {
+            let stats = by_key.entry(property.key.clone()).or_default();
+            let entry = stats
+                .entry(property.value.to_lowercase())
+                .or_insert_with(|| ValueStat {
+                    label: property.label.clone(),
+                    value: property.value.clone(),
+                    count: 0,
+                    samples: Vec::new(),
+                });
+            entry.count += 1;
+            if entry.samples.len() < 3 && !entry.samples.contains(&sample.title) {
+                entry.samples.push(sample.title.clone());
+            }
+        }
+    }
+
+    let mut out: Vec<(usize, RuleSuggestion)> = Vec::new();
+    for (key, values) in by_key {
+        // Un champ qui vaut toujours la même chose ne découpe rien ; un champ
+        // qui vaut autre chose à chaque séance ne se colorie pas.
+        if values.len() < 2 || values.len() > MAX_DISTINCT_VALUES {
+            continue;
+        }
+        let coverage: usize = values.values().map(|stat| stat.count).sum();
+
+        for stat in values.into_values() {
+            if stat.count < MIN_OCCURRENCES || covered(existing, Some(&key), &stat.value) {
+                continue;
+            }
+            out.push((
+                coverage,
+                RuleSuggestion {
+                    label: format!("{} : {}", stat.label, stat.value),
+                    field: RuleField::Property,
+                    property: Some(key.clone()),
+                    match_kind: RuleMatch::Equals,
+                    pattern: stat.value,
+                    occurrences: stat.count as u32,
+                    samples: stat.samples,
+                    suggested_color: 0,
+                },
+            ));
+        }
+    }
+
+    // Le champ qui couvre le plus de séances d'abord, puis ses valeurs les plus
+    // fréquentes : la liste commence par ce qui change le plus l'écran.
+    out.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.occurrences.cmp(&a.1.occurrences))
+            .then(a.1.pattern.cmp(&b.1.pattern))
+    });
+    out.truncate(MAX_SUGGESTIONS);
+
+    out.into_iter()
+        .enumerate()
+        .map(|(index, (_, mut suggestion))| {
+            suggestion.suggested_color = pick_color(palette, index);
+            suggestion
+        })
+        .collect()
+}
+
+fn suggest_from_titles(
+    samples: &[Sample],
+    existing: &[Rule],
+    palette: &[u32],
+) -> Vec<RuleSuggestion> {
     let mut counts: HashMap<String, (usize, Vec<String>)> = HashMap::new();
     for sample in samples {
         // Un même mot répété dans un titre ne compte qu'une fois : on cherche
@@ -184,7 +294,7 @@ pub fn suggest(samples: &[Sample], existing: &[Rule], palette: &[u32]) -> Vec<Ru
     let mut ranked: Vec<(String, usize, Vec<String>)> = counts
         .into_iter()
         .filter(|(key, (count, _))| {
-            *count >= MIN_OCCURRENCES && *count < total && !covered.contains(key)
+            *count >= MIN_OCCURRENCES && *count < total && !covered(existing, None, key)
         })
         .map(|(key, (count, samples))| (key, count, samples))
         .collect();
@@ -204,13 +314,31 @@ pub fn suggest(samples: &[Sample], existing: &[Rule], palette: &[u32]) -> Vec<Ru
         .map(|(index, (pattern, count, samples))| RuleSuggestion {
             label: label_for(&pattern),
             field: RuleField::Title,
+            property: None,
             match_kind: RuleMatch::Word,
-            pattern: pattern.clone(),
+            pattern,
             occurrences: count as u32,
             samples,
-            suggested_color: palette[index % palette.len().max(1)],
+            suggested_color: pick_color(palette, index),
         })
         .collect()
+}
+
+/// Vrai si une règle existante traite déjà ce motif sur ce champ.
+fn covered(existing: &[Rule], property: Option<&String>, pattern: &str) -> bool {
+    let pattern = pattern.trim().to_lowercase();
+    existing.iter().any(|rule| {
+        rule.pattern.trim().to_lowercase() == pattern
+            && rule.property.as_deref() == property.map(|p| p.as_str())
+    })
+}
+
+fn pick_color(palette: &[u32], index: usize) -> u32 {
+    if palette.is_empty() {
+        0xFF4C5FD5
+    } else {
+        palette[index % palette.len()]
+    }
 }
 
 /// Un mot mérite d'être proposé s'il ressemble à un marqueur de type, ou à une

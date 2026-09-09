@@ -1,6 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+        Réseau : uniquement pour retélécharger l'abonnement `.ics` choisi par
+        l'utilisateur. Rien d'autre ne sort de l'appareil.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Rappels avant les cours, et résumé du matin. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        Un rappel « quinze minutes avant » n'a de sens qu'à l'heure dite :
+        c'est le cas d'usage d'une alarme exacte. `USE_EXACT_ALARM` couvre
+        Android 13 et plus, `SCHEDULE_EXACT_ALARM` les deux versions d'avant.
+    -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        android:maxSdkVersion="32" />
+
+    <!-- Les alarmes ne survivent pas au redémarrage : on les repose. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <application
         android:name=".TimewrapApp"
         android:allowBackup="true"
@@ -55,6 +78,24 @@
                 <data android:mimeType="text/calendar" />
             </intent-filter>
         </activity>
+
+        <!-- Poste la notification d'un rappel, à l'heure prévue. -->
+        <receiver
+            android:name=".notify.ReminderReceiver"
+            android:exported="false" />
+
+        <!--
+            Après un redémarrage — ou une mise à jour de l'application — les
+            alarmes posées sont perdues. Ce récepteur les repose.
+        -->
+        <receiver
+            android:name=".notify.BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>
