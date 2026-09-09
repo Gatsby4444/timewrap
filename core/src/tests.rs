@@ -10,7 +10,9 @@ use chrono::{TimeZone, Utc};
 use chrono_tz::Europe::Paris;
 
 use crate::ics;
-use crate::model::CalendarKind;
+use crate::model::{
+    CalendarKind, ConflictScope, EventDraft, EventOrigin, Resolution, Rule, RuleField, RuleMatch,
+};
 use crate::store::Store;
 
 const FIXTURE: &str = include_str!("../tests/fixtures/ent_ade.ics");
@@ -196,14 +198,14 @@ fn store_with_fixture() -> (Store, String) {
 fn import_puis_reimport_laisse_le_meme_etat() {
     let (store, calendar_id) = store_with_fixture();
     let premier = store
-        .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0))
+        .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0), &None)
         .unwrap();
 
     store
         .reimport_ics(&calendar_id, FIXTURE, utc(2026, 9, 15, 12, 0))
         .expect("réimport");
     let second = store
-        .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0))
+        .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0), &None)
         .unwrap();
 
     assert_eq!(premier.len(), second.len());
@@ -219,7 +221,7 @@ fn la_vue_jour_regroupe_selon_le_fuseau_local() {
     let (store, _) = store_with_fixture();
     // Lundi 21 septembre 2026.
     let epoch_day = 20_717;
-    let jour = store.day(epoch_day).unwrap();
+    let jour = store.day(epoch_day, &None).unwrap();
     assert_eq!(jour.epoch_day, epoch_day);
     assert!(
         jour.occurrences.iter().any(|o| o.title.contains("DEV WEB")),
@@ -236,7 +238,7 @@ fn un_agenda_masque_disparait_des_requetes() {
     let (store, calendar_id) = store_with_fixture();
     store.set_visible(&calendar_id, false).unwrap();
     let visibles = store
-        .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0))
+        .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0), &None)
         .unwrap();
     assert!(visibles.is_empty());
 }
@@ -246,7 +248,7 @@ fn la_vue_maintenant_designe_le_cours_en_cours() {
     let (store, _) = store_with_fixture();
     // Lundi 21 septembre 2026, 08h30 à Paris : en plein CM de 08h00 à 10h00.
     let now = paris(2026, 9, 21, 8, 30);
-    let vue = store.now_view(now).unwrap();
+    let vue = store.now_view(now, &None).unwrap();
 
     let current = vue.current.expect("un cours est en cours");
     assert!(current.title.contains("DEV WEB"));
@@ -263,8 +265,743 @@ fn supprimer_un_agenda_emporte_ses_occurrences() {
     assert!(store.calendars().unwrap().is_empty());
     assert!(
         store
-            .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0))
+            .occurrences_between(utc(2026, 8, 1, 0, 0), utc(2027, 1, 1, 0, 0), &None)
             .unwrap()
             .is_empty()
+    );
+}
+
+// ------------------------------------------------- agendas comme des dossiers
+
+/// Un jeu de départ : l'emploi du temps importé, plus un agenda personnel vide.
+fn store_with_folders() -> (Store, String, String) {
+    let (store, ecole) = store_with_fixture();
+    let perso = store
+        .create_calendar(
+            "Perso",
+            CalendarKind::Local,
+            "",
+            None,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .expect("agenda local")
+        .id;
+    (store, ecole, perso)
+}
+
+/// Un brouillon d'événement, pour ne pas répéter dix champs par test.
+fn draft(calendar_id: &str, title: &str, start: i64, end: i64) -> EventDraft {
+    EventDraft {
+        id: None,
+        calendar_id: calendar_id.to_string(),
+        title: title.to_string(),
+        location: String::new(),
+        description: String::new(),
+        start_utc: start,
+        end_utc: end,
+        all_day: false,
+        category_id: None,
+    }
+}
+
+#[test]
+fn un_agenda_local_se_cree_et_se_remplit() {
+    let (store, _, perso) = store_with_folders();
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Piscine",
+                paris(2026, 9, 22, 18, 0),
+                paris(2026, 9, 22, 19, 0),
+            ),
+            Resolution::Cancel,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .expect("écriture");
+    let saved = outcome.saved.expect("l'événement est écrit");
+    assert_eq!(saved.title, "Piscine");
+    assert_eq!(saved.origin, EventOrigin::Local);
+    assert!(!outcome.blocked);
+}
+
+#[test]
+fn la_portee_isole_un_agenda_des_autres() {
+    let (store, ecole, perso) = store_with_folders();
+    store
+        .save_event(
+            &draft(
+                &perso,
+                "Piscine",
+                paris(2026, 9, 22, 18, 0),
+                paris(2026, 9, 22, 19, 0),
+            ),
+            Resolution::Cancel,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    let seul_perso = store
+        .occurrences_between(
+            utc(2026, 9, 1, 0, 0),
+            utc(2026, 10, 1, 0, 0),
+            &Some(vec![perso.clone()]),
+        )
+        .unwrap();
+    assert_eq!(seul_perso.len(), 1);
+    assert_eq!(seul_perso[0].title, "Piscine");
+
+    let seule_ecole = store
+        .occurrences_between(
+            utc(2026, 9, 1, 0, 0),
+            utc(2026, 10, 1, 0, 0),
+            &Some(vec![ecole]),
+        )
+        .unwrap();
+    assert!(seule_ecole.iter().all(|o| o.title != "Piscine"));
+}
+
+#[test]
+fn un_agenda_masque_reste_consultable_quand_on_louvre() {
+    let (store, _, perso) = store_with_folders();
+    store
+        .save_event(
+            &draft(
+                &perso,
+                "Piscine",
+                paris(2026, 9, 22, 18, 0),
+                paris(2026, 9, 22, 19, 0),
+            ),
+            Resolution::Cancel,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+    store.set_visible(&perso, false).unwrap();
+
+    // Absent de la vue d'ensemble...
+    let ensemble = store
+        .occurrences_between(utc(2026, 9, 1, 0, 0), utc(2026, 10, 1, 0, 0), &None)
+        .unwrap();
+    assert!(ensemble.iter().all(|o| o.title != "Piscine"));
+
+    // ...mais présent quand on ouvre le dossier lui-même.
+    let ouvert = store
+        .occurrences_between(
+            utc(2026, 9, 1, 0, 0),
+            utc(2026, 10, 1, 0, 0),
+            &Some(vec![perso]),
+        )
+        .unwrap();
+    assert_eq!(ouvert.len(), 1);
+}
+
+#[test]
+fn laccueil_resume_chaque_agenda() {
+    let (store, _, perso) = store_with_folders();
+    store
+        .save_event(
+            &draft(
+                &perso,
+                "Piscine",
+                paris(2026, 9, 22, 18, 0),
+                paris(2026, 9, 22, 19, 0),
+            ),
+            Resolution::Cancel,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    let resumes = store.calendar_summaries(paris(2026, 9, 21, 7, 0)).unwrap();
+    assert_eq!(resumes.len(), 2);
+
+    let piscine = resumes
+        .iter()
+        .find(|r| r.calendar.id == perso)
+        .expect("l'agenda perso est résumé");
+    assert_eq!(piscine.upcoming_week, 1);
+    assert_eq!(
+        piscine.next.as_ref().map(|o| o.title.as_str()),
+        Some("Piscine")
+    );
+    assert_eq!(piscine.conflicts, 0);
+}
+
+// ------------------------------------------------------- moteur de conflits
+
+#[test]
+fn un_chevauchement_bloque_lecriture_et_sexplique() {
+    let (store, _, perso) = store_with_folders();
+    // Lundi 21 septembre, 08h00-10h00 : le CM de DEV WEB occupe déjà le créneau.
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Dentiste",
+                paris(2026, 9, 21, 9, 0),
+                paris(2026, 9, 21, 10, 30),
+            ),
+            Resolution::Cancel,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    assert!(outcome.blocked, "rien ne doit être écrit sans arbitrage");
+    assert!(outcome.saved.is_none());
+    assert_eq!(outcome.conflicts.len(), 1);
+
+    let conflit = &outcome.conflicts[0];
+    assert_eq!(conflit.scope, ConflictScope::CrossCalendar);
+    assert_eq!(conflit.overlap_minutes, 60);
+    assert!(
+        !conflit.other_deletable,
+        "une séance importée ne se supprime pas"
+    );
+}
+
+#[test]
+fn deux_creneaux_du_meme_agenda_se_signalent_comme_tels() {
+    let (store, _, perso) = store_with_folders();
+    let now = utc(2026, 9, 15, 12, 0);
+    store
+        .save_event(
+            &draft(
+                &perso,
+                "Sport",
+                paris(2026, 9, 26, 10, 0),
+                paris(2026, 9, 26, 12, 0),
+            ),
+            Resolution::Cancel,
+            now,
+        )
+        .unwrap();
+
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Courses",
+                paris(2026, 9, 26, 11, 0),
+                paris(2026, 9, 26, 11, 30),
+            ),
+            Resolution::Cancel,
+            now,
+        )
+        .unwrap();
+
+    assert!(outcome.blocked);
+    assert_eq!(outcome.conflicts[0].scope, ConflictScope::SameCalendar);
+    assert!(
+        outcome.conflicts[0].other_deletable,
+        "une séance locale, elle, peut être supprimée"
+    );
+}
+
+#[test]
+fn ignorer_ecrit_malgre_le_chevauchement() {
+    let (store, _, perso) = store_with_folders();
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Dentiste",
+                paris(2026, 9, 21, 9, 0),
+                paris(2026, 9, 21, 10, 30),
+            ),
+            Resolution::Ignore,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    assert!(!outcome.blocked);
+    assert!(outcome.saved.is_some());
+    assert_eq!(outcome.conflicts.len(), 1, "le conflit reste signalé");
+}
+
+#[test]
+fn remplacer_libere_le_creneau() {
+    let (store, _, perso) = store_with_folders();
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Dentiste",
+                paris(2026, 9, 21, 9, 0),
+                paris(2026, 9, 21, 10, 30),
+            ),
+            Resolution::Replace,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    assert!(outcome.saved.is_some());
+    assert_eq!(outcome.removed, 0, "rien de local à supprimer");
+    assert_eq!(outcome.hidden, 1, "la séance importée est masquée");
+
+    let lundi = store.day(20_717, &None).unwrap();
+    assert!(
+        lundi
+            .occurrences
+            .iter()
+            .all(|o| !o.title.contains("DEV WEB")),
+        "le CM masqué ne doit plus apparaître"
+    );
+    assert!(lundi.occurrences.iter().any(|o| o.title == "Dentiste"));
+}
+
+#[test]
+fn remplacer_supprime_ce_qui_est_local() {
+    let (store, _, perso) = store_with_folders();
+    let now = utc(2026, 9, 15, 12, 0);
+    store
+        .save_event(
+            &draft(
+                &perso,
+                "Sport",
+                paris(2026, 9, 26, 10, 0),
+                paris(2026, 9, 26, 12, 0),
+            ),
+            Resolution::Cancel,
+            now,
+        )
+        .unwrap();
+
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Courses",
+                paris(2026, 9, 26, 11, 0),
+                paris(2026, 9, 26, 11, 30),
+            ),
+            Resolution::Replace,
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(outcome.removed, 1);
+    assert_eq!(outcome.hidden, 0);
+}
+
+#[test]
+fn decaler_pousse_levenement_apres_le_conflit() {
+    let (store, _, perso) = store_with_folders();
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Dentiste",
+                paris(2026, 9, 21, 9, 0),
+                paris(2026, 9, 21, 10, 0),
+            ),
+            Resolution::ShiftAfter,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    let saved = outcome.saved.expect("l'événement décalé est écrit");
+    // Le CM finit à 10h00 : le rendez-vous d'une heure commence donc à 10h00.
+    assert_eq!(saved.start_utc, paris(2026, 9, 21, 10, 0));
+    assert_eq!(saved.end_utc - saved.start_utc, 3600);
+    assert_eq!(outcome.shifted_minutes, 60);
+}
+
+#[test]
+fn le_gestionnaire_liste_les_chevauchements_existants() {
+    let (store, _, perso) = store_with_folders();
+    store
+        .save_event(
+            &draft(
+                &perso,
+                "Dentiste",
+                paris(2026, 9, 21, 9, 0),
+                paris(2026, 9, 21, 10, 30),
+            ),
+            Resolution::Ignore,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    let paires = store
+        .conflicts_between(paris(2026, 9, 21, 0, 0), paris(2026, 9, 22, 0, 0), &None)
+        .unwrap();
+    assert_eq!(paires.len(), 1);
+    assert_eq!(paires[0].scope, ConflictScope::CrossCalendar);
+    assert_eq!(paires[0].overlap_minutes, 60);
+}
+
+#[test]
+fn deux_creneaux_qui_senchainent_ne_sont_pas_en_conflit() {
+    let (store, _, perso) = store_with_folders();
+    // 10h00-11h00, juste après le CM qui finit à 10h00.
+    let outcome = store
+        .save_event(
+            &draft(
+                &perso,
+                "Café",
+                paris(2026, 9, 21, 10, 0),
+                paris(2026, 9, 21, 11, 0),
+            ),
+            Resolution::Cancel,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+    assert!(!outcome.blocked);
+    assert!(outcome.conflicts.is_empty());
+}
+
+#[test]
+fn deplacer_un_evenement_ne_le_heurte_pas_lui_meme() {
+    let (store, _, perso) = store_with_folders();
+    let now = utc(2026, 9, 15, 12, 0);
+    let saved = store
+        .save_event(
+            &draft(
+                &perso,
+                "Sport",
+                paris(2026, 9, 26, 10, 0),
+                paris(2026, 9, 26, 12, 0),
+            ),
+            Resolution::Cancel,
+            now,
+        )
+        .unwrap()
+        .saved
+        .unwrap();
+
+    let mut modifie = draft(
+        &perso,
+        "Sport",
+        paris(2026, 9, 26, 10, 30),
+        paris(2026, 9, 26, 12, 30),
+    );
+    modifie.id = Some(saved.id.clone());
+    let outcome = store.save_event(&modifie, Resolution::Cancel, now).unwrap();
+
+    assert!(
+        !outcome.blocked,
+        "un événement ne se heurte pas à sa propre version"
+    );
+    assert_eq!(
+        outcome.saved.map(|o| o.start_utc),
+        Some(paris(2026, 9, 26, 10, 30))
+    );
+}
+
+#[test]
+fn une_seance_importee_ne_se_supprime_pas() {
+    let (store, _) = store_with_fixture();
+    let lundi = store.day(20_717, &None).unwrap();
+    let importee = &lundi.occurrences[0];
+    assert!(store.delete_event(&importee.id).is_err());
+
+    // Elle se masque, en revanche, et se réaffiche.
+    store.set_muted(&importee.id, true).unwrap();
+    assert!(store.day(20_717, &None).unwrap().occurrences.is_empty());
+    store.set_muted(&importee.id, false).unwrap();
+    assert_eq!(store.day(20_717, &None).unwrap().occurrences.len(), 1);
+}
+
+#[test]
+fn une_seance_masquee_le_reste_apres_reimport() {
+    let (store, calendar_id) = store_with_fixture();
+    let importee = store.day(20_717, &None).unwrap().occurrences[0].clone();
+    store.set_muted(&importee.id, true).unwrap();
+
+    store
+        .reimport_ics(&calendar_id, FIXTURE, utc(2026, 9, 15, 12, 0))
+        .unwrap();
+
+    assert!(
+        store.day(20_717, &None).unwrap().occurrences.is_empty(),
+        "le masquage doit survivre au réimport"
+    );
+}
+
+// ------------------------------------------------ moteur de règles visuelles
+
+/// Une règle nue, que chaque test précise ensuite.
+fn rule(pattern: &str) -> Rule {
+    Rule {
+        id: String::new(),
+        name: String::new(),
+        calendar_id: None,
+        field: RuleField::Title,
+        match_kind: RuleMatch::Word,
+        pattern: pattern.to_string(),
+        case_sensitive: false,
+        category_id: None,
+        rename_to: None,
+        hide: false,
+        priority: 0,
+        enabled: true,
+        match_count: 0,
+    }
+}
+
+#[test]
+fn une_regle_colorie_dun_coup_toutes_les_seances_dun_type() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    let categorie = store
+        .create_category("Cours magistral", "CM", Some(0xFF11_2233), now)
+        .unwrap();
+
+    let posee = store
+        .save_rule(
+            &Rule {
+                category_id: Some(categorie.id.clone()),
+                ..rule("CM")
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(posee.match_count, 11, "les 11 séances de DEV WEB");
+
+    let lundi = store.day(20_717, &None).unwrap();
+    let cm = &lundi.occurrences[0];
+    assert_eq!(cm.color, 0xFF11_2233, "la couleur vient de la catégorie");
+    assert_eq!(cm.category_label, "CM");
+    assert_eq!(cm.category_name, "Cours magistral");
+
+    // Le TP de BDD, lui, garde la couleur de son agenda.
+    let mardi = store.day(20_718, &None).unwrap();
+    assert!(mardi.occurrences.iter().all(|o| o.category_id.is_none()));
+}
+
+#[test]
+fn retirer_une_regle_rend_leur_apparence_aux_seances() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    let categorie = store
+        .create_category("CM", "CM", Some(0xFF11_2233), now)
+        .unwrap();
+    let posee = store
+        .save_rule(
+            &Rule {
+                category_id: Some(categorie.id),
+                ..rule("CM")
+            },
+            now,
+        )
+        .unwrap();
+
+    store.delete_rule(&posee.id).unwrap();
+    let lundi = store.day(20_717, &None).unwrap();
+    assert!(lundi.occurrences[0].category_id.is_none());
+    assert_ne!(lundi.occurrences[0].color, 0xFF11_2233);
+}
+
+#[test]
+fn une_regle_renomme_sans_perdre_lintitule_dorigine() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    store
+        .save_rule(
+            &Rule {
+                rename_to: Some("★ {}".to_string()),
+                ..rule("CM")
+            },
+            now,
+        )
+        .unwrap();
+
+    let cm = &store.day(20_717, &None).unwrap().occurrences[0];
+    assert!(cm.title.starts_with("★ "), "titre obtenu : {}", cm.title);
+    assert_eq!(
+        cm.raw_title, "R3.01 DEV WEB - CM (Gr A)",
+        "l'intitulé de l'ENT reste disponible"
+    );
+}
+
+#[test]
+fn une_regle_de_masquage_retire_les_seances_des_vues() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    store
+        .save_rule(
+            &Rule {
+                hide: true,
+                ..rule("CM")
+            },
+            now,
+        )
+        .unwrap();
+
+    assert!(store.day(20_717, &None).unwrap().occurrences.is_empty());
+
+    // Mais les données restent, et la règle désactivée les ramène.
+    let regle = store.rules().unwrap().remove(0);
+    store
+        .save_rule(
+            &Rule {
+                enabled: false,
+                ..regle
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(store.day(20_717, &None).unwrap().occurrences.len(), 1);
+}
+
+#[test]
+fn le_mot_entier_ne_saccroche_pas_a_un_autre_mot() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    // « TD » ne doit pas reconnaître « BDD ».
+    let posee = store.save_rule(&rule("TD"), now).unwrap();
+    assert_eq!(posee.match_count, 1, "seule la séance de RESEAUX est un TD");
+}
+
+#[test]
+fn une_categorie_posee_a_la_main_resiste_aux_regles() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    let choisie = store
+        .create_category("Important", "!", Some(0xFF00_FF00), now)
+        .unwrap();
+    let auto = store
+        .create_category("CM", "CM", Some(0xFF11_2233), now)
+        .unwrap();
+
+    let cm = store.day(20_717, &None).unwrap().occurrences[0].clone();
+    store
+        .set_occurrence_category(&cm.id, Some(choisie.id.clone()))
+        .unwrap();
+    store
+        .save_rule(
+            &Rule {
+                category_id: Some(auto.id),
+                ..rule("CM")
+            },
+            now,
+        )
+        .unwrap();
+
+    let apres = store.day(20_717, &None).unwrap().occurrences[0].clone();
+    assert_eq!(apres.category_id, Some(choisie.id));
+    assert_eq!(apres.color, 0xFF00_FF00);
+}
+
+#[test]
+fn une_regle_sapplique_aussi_a_ce_qui_arrive_apres() {
+    let (store, ecole, _) = store_with_folders();
+    let now = utc(2026, 9, 15, 12, 0);
+    let categorie = store
+        .create_category("CM", "CM", Some(0xFF11_2233), now)
+        .unwrap();
+    store
+        .save_rule(
+            &Rule {
+                category_id: Some(categorie.id),
+                ..rule("CM")
+            },
+            now,
+        )
+        .unwrap();
+
+    store.reimport_ics(&ecole, FIXTURE, now).unwrap();
+    let cm = &store.day(20_717, &None).unwrap().occurrences[0];
+    assert_eq!(
+        cm.color, 0xFF11_2233,
+        "un réimport ne doit pas décolorier l'emploi du temps"
+    );
+}
+
+#[test]
+fn les_suggestions_reperent_les_types_de_cours() {
+    let (store, _) = store_with_fixture();
+    let suggestions = store.rule_suggestions(&None).unwrap();
+    let motifs: Vec<&str> = suggestions.iter().map(|s| s.pattern.as_str()).collect();
+
+    assert!(motifs.contains(&"cm"), "obtenu : {motifs:?}");
+    assert!(motifs.contains(&"tp"), "obtenu : {motifs:?}");
+    // Les marqueurs de type passent devant les noms de matière.
+    let rang_cm = motifs.iter().position(|m| *m == "cm").unwrap();
+    let rang_bdd = motifs.iter().position(|m| *m == "bdd").unwrap();
+    assert!(rang_cm < rang_bdd);
+
+    let cm = suggestions.iter().find(|s| s.pattern == "cm").unwrap();
+    assert_eq!(cm.occurrences, 11);
+    assert!(!cm.samples.is_empty());
+}
+
+#[test]
+fn accepter_une_suggestion_cree_categorie_et_regle() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    let suggestion = store
+        .rule_suggestions(&None)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.pattern == "cm")
+        .unwrap();
+
+    let regle = store
+        .accept_suggestion(&suggestion, "Cours magistral", "CM", None, now)
+        .unwrap();
+    assert_eq!(regle.match_count, 11);
+    assert_eq!(store.categories().unwrap().len(), 1);
+
+    let cm = &store.day(20_717, &None).unwrap().occurrences[0];
+    assert_eq!(cm.category_label, "CM");
+
+    // Une fois la règle posée, le motif ne doit plus être proposé.
+    let restantes = store.rule_suggestions(&None).unwrap();
+    assert!(restantes.iter().all(|s| s.pattern != "cm"));
+}
+
+#[test]
+fn supprimer_une_categorie_ne_perd_pas_les_seances() {
+    let (store, _) = store_with_fixture();
+    let now = utc(2026, 9, 15, 12, 0);
+    let categorie = store
+        .create_category("CM", "CM", Some(0xFF11_2233), now)
+        .unwrap();
+    store
+        .save_rule(
+            &Rule {
+                category_id: Some(categorie.id.clone()),
+                ..rule("CM")
+            },
+            now,
+        )
+        .unwrap();
+
+    store.delete_category(&categorie.id).unwrap();
+    let lundi = store.day(20_717, &None).unwrap();
+    assert_eq!(lundi.occurrences.len(), 1);
+    assert!(lundi.occurrences[0].category_id.is_none());
+}
+
+#[test]
+fn une_seance_masquee_reste_rappelable() {
+    let (store, _, perso) = store_with_folders();
+    store
+        .save_event(
+            &draft(
+                &perso,
+                "Dentiste",
+                paris(2026, 9, 21, 9, 0),
+                paris(2026, 9, 21, 10, 30),
+            ),
+            Resolution::Replace,
+            utc(2026, 9, 15, 12, 0),
+        )
+        .unwrap();
+
+    let masquees = store
+        .muted_between(paris(2026, 9, 21, 0, 0), paris(2026, 9, 22, 0, 0))
+        .unwrap();
+    assert_eq!(masquees.len(), 1);
+    assert!(masquees[0].title.contains("DEV WEB"));
+
+    store.set_muted(&masquees[0].id, false).unwrap();
+    assert!(
+        store
+            .day(20_717, &None)
+            .unwrap()
+            .occurrences
+            .iter()
+            .any(|o| o.title.contains("DEV WEB"))
     );
 }

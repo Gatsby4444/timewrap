@@ -16,6 +16,12 @@ pub enum TimewrapError {
     #[error("agenda introuvable : {0}")]
     CalendarNotFound(String),
 
+    #[error("introuvable : {0}")]
+    NotFound(String),
+
+    #[error("{0}")]
+    InvalidEvent(String),
+
     #[error("fuseau horaire inconnu : {0}")]
     UnknownTimezone(String),
 }

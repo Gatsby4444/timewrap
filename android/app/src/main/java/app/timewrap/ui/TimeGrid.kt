@@ -208,6 +208,9 @@ private fun OccurrenceBlock(
                 .background(if (faded) accent.copy(alpha = 0.4f) else accent),
         )
         Column(Modifier.padding(start = 8.dp)) {
+            if (!compact && occurrence.categoryLabel.isNotBlank()) {
+                CategoryChip(occurrence.categoryLabel, accent)
+            }
             Text(
                 text = occurrence.title,
                 style = if (compact) {

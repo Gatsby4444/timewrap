@@ -280,13 +280,19 @@ fun OccurrenceRow(occurrence: Occurrence, onSelect: (Occurrence) -> Unit) {
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                text = if (occurrence.cancelled) "${occurrence.title} — annulé" else occurrence.title,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Medium,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (occurrence.categoryLabel.isNotBlank()) {
+                    CategoryChip(occurrence.categoryLabel, accent)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(
+                    text = if (occurrence.cancelled) "${occurrence.title} — annulé" else occurrence.title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             if (occurrence.location.isNotBlank()) {
                 Text(
                     text = occurrence.location,

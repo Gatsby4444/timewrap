@@ -7,9 +7,11 @@ quoi après ?*
 Elle lit les exports **iCalendar** d'un ENT — fichier `.ics` ou URL d'abonnement — et les
 restitue dans une interface mobile, hors-ligne, sans compte ni serveur.
 
-> État : **phase 1**. L'application lit un export `.ics`, le stocke hors ligne et l'affiche dans
-> trois vues — Maintenant, Jour, Semaine. La synchronisation automatique et les rappels arrivent
-> ensuite. Voir la feuille de route.
+> État : **phases 1, 3 et 4** livrées. L'application lit un export `.ics`, le stocke hors ligne
+> et l'affiche dans trois vues — Maintenant, Jour, Semaine. Chaque agenda est un dossier que l'on
+> peut ouvrir seul, on y saisit ses propres créneaux, un moteur central signale les
+> chevauchements, et des règles visuelles colorient l'emploi du temps par type de cours. Reste la
+> phase 2 : abonnement par URL, synchronisation automatique et rappels. Voir la feuille de route.
 
 ## Architecture
 
@@ -17,7 +19,7 @@ Deux moitiés, une frontière nette.
 
 | | |
 |---|---|
-| **`core/`** — Rust | Tout le domaine métier : parsing iCalendar, expansion des récurrences (RRULE/RDATE/EXDATE), fuseaux et heure d'été, stockage SQLite, moteur de règles de renommage, diff de synchronisation, calcul des rappels. |
+| **`core/`** — Rust | Tout le domaine métier : parsing iCalendar, expansion des récurrences (RRULE/RDATE/EXDATE), fuseaux et heure d'été, stockage SQLite, moteur de règles visuelles, moteur de chevauchements, diff de synchronisation et calcul des rappels à venir. |
 | **`android/`** — Kotlin + Jetpack Compose | Uniquement ce qui doit être natif : rendu, gestes, réseau, alarmes, notifications, sélecteur de fichiers. |
 
 Le pont entre les deux est généré par [UniFFI](https://mozilla.github.io/uniffi-rs/) : Gradle
@@ -27,6 +29,55 @@ côtés, donc aucune ne peut diverger.
 
 Ce découpage sert aussi le portage iOS prévu plus tard : UniFFI génère également du Swift, et
 `core/` sera réutilisé tel quel.
+
+## Les trois moteurs
+
+Trois questions reviennent sans cesse quand on tient plusieurs emplois du temps. Chacune a son
+module dans `core/`, sans état ni base de données, donc testable ligne à ligne.
+
+### Les agendas sont des dossiers
+
+Un agenda — un export d'ENT, un agenda personnel créé sur place — s'ouvre **seul** ou se mêle aux
+autres. Toutes les vues acceptent une *portée* : absente, elles montrent les agendas non masqués ;
+renseignée, elle l'emporte sur la visibilité, parce qu'ouvrir un dossier doit le montrer même
+décoché dans la vue d'ensemble. L'écran d'accueil en donne une tuile par agenda : ce qui vient
+cette semaine, la prochaine séance, les chevauchements en attente.
+
+### Le moteur de chevauchements — `core/src/conflict.rs`
+
+Toute écriture d'événement passe par `save_event`, et **rien n'est écrit tant qu'un chevauchement
+subsiste** : le cœur rend la liste des heurts, l'interface pose la question, puis rappelle avec la
+décision. Quatre issues :
+
+| | |
+|---|---|
+| **Annuler** | On renonce ; c'est le défaut, celui qui déclenche la question. |
+| **Remplacer** | Fait place nette : supprime les créneaux saisis ici, masque les séances importées — les effacer serait vain, le prochain import les ramènerait. |
+| **Décaler après** | Repousse le nouveau créneau juste après le dernier conflit, durée conservée, en cascade s'il en heurte un autre. |
+| **Ignorer** | Assume le chevauchement : deux cours peuvent légitimement se superposer. |
+
+Le heurt est qualifié — même agenda ou agendas différents — et chiffré en minutes de recouvrement.
+Deux créneaux qui s'enchaînent ne comptent pas : finir à 10:00 et commencer à 10:00 est un
+enchaînement, pas un conflit. Un gestionnaire liste par ailleurs les chevauchements déjà en place
+sur les deux mois qui viennent, et rappelle les séances masquées pour que « Remplacer » reste
+réversible.
+
+### Le moteur de règles visuelles — `core/src/rules.rs`
+
+Un ENT livre « R3.01 DEV WEB - CM (Gr A) » et rien qui distingue un amphi d'un TP. Plutôt que de
+recolorier séance par séance, on décrit **une fois** ce qui les reconnaît : un champ (titre, lieu,
+notes, ou les trois), une comparaison (mot entier, contient, commence par…), et trois effets
+cumulables — poser une catégorie donc une couleur, renommer, masquer.
+
+Le cœur propose d'abord : il repère dans les intitulés importés les mots qui reviennent dans
+plusieurs séances mais pas dans toutes — ceux-là découpent l'emploi du temps — et met les
+marqueurs de type connus (CM, TD, TP, examen…) devant les noms de matière. Accepter une suggestion
+crée la catégorie et la règle d'un geste.
+
+Les décisions sont matérialisées à l'écriture, jamais recalculées à l'affichage, et rejouées d'un
+bloc quand une règle change. L'intitulé de l'ENT est conservé à côté du titre affiché : retirer
+une règle rend son nom d'origine à la séance, sans réimport. Une catégorie posée à la main sur une
+séance précise résiste aux règles — l'exception survit au moteur.
 
 ## Prérequis
 
@@ -97,10 +148,10 @@ entrer : les fixtures de `core/tests/fixtures/` sont anonymisées.
 |---|---|
 | **0** ✅ | Squelette, chaîne Rust → NDK → APK signé, CI, auto-diagnostic embarqué |
 | **1** ✅ | Lecture iCalendar, stockage, import de fichier, vues Maintenant / Jour / Semaine |
+| **3** ✅ | Catégories, couleurs et masquage par règle, avec suggestions déduites des imports |
+| **4** ✅ | Agendas locaux éditables, écran d'accueil par dossier, moteur de chevauchements |
 | **2** | Abonnement par URL, synchronisation automatique, notifications de changement, rappels |
-| **3** | Renommage, couleurs et masquage des cours, avec suggestions automatiques |
-| **4** | Agendas locaux éditables, vues Cours / Perso / Projets, notes et devoirs |
-| **5** | Widget, finitions, puis portage iOS sur le même cœur |
+| **5** | Notes et devoirs, widget, finitions, puis portage iOS sur le même cœur |
 
 ## Licence
 
