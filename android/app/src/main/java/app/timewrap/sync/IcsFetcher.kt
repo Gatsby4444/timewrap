@@ -1,8 +1,20 @@
 package app.timewrap.sync
 
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
+import java.net.UnknownHostException
+import java.security.GeneralSecurityException
 import java.util.zip.GZIPInputStream
+import javax.net.ssl.SSLException
+
+/**
+ * Un téléchargement qui a échoué, dit en français.
+ *
+ * Le message d'origine est conservé en cause : il n'a rien à faire sous les yeux
+ * de quelqu'un qui veut son emploi du temps, mais tout à faire dans un journal.
+ */
+class IcsFetchError(message: String, cause: Throwable) : Exception(message, cause)
 
 /**
  * Téléchargement d'un abonnement `.ics`.
@@ -25,7 +37,34 @@ object IcsFetcher {
      * Les adresses `webcal://` sont l'usage courant des ENT : c'est du HTTPS
      * déguisé, on le traduit plutôt que de le refuser.
      */
-    fun fetch(rawUrl: String): Result<String> = runCatching {
+    fun fetch(rawUrl: String): Result<String> =
+        runCatching { download(rawUrl) }
+            .recoverCatching { throw IcsFetchError(explain(it), it) }
+
+    /**
+     * Traduit un échec réseau en une phrase qui dit quoi faire.
+     *
+     * Un « CertPathValidatorException » n'apprend rien à personne, et surtout
+     * pas que le problème vient du téléphone et non de l'ENT.
+     */
+    private fun explain(error: Throwable): String = when (error) {
+        // Nos propres refus sont déjà écrits pour être lus.
+        is IllegalStateException -> error.message ?: "réponse inattendue de l'ENT"
+
+        is SSLException, is GeneralSecurityException ->
+            "connexion sécurisée refusée. Android ne reconnaît pas l'autorité qui " +
+                "a signé le certificat de l'ENT — vérifiez d'abord que la date et " +
+                "l'heure de l'appareil sont justes."
+
+        is UnknownHostException ->
+            "site introuvable. Vérifiez le réseau, et l'orthographe de l'adresse."
+
+        is SocketTimeoutException -> "l'ENT n'a pas répondu à temps."
+
+        else -> error.message ?: error.toString()
+    }
+
+    private fun download(rawUrl: String): String {
         var url = URL(normalize(rawUrl))
 
         repeat(MAX_REDIRECTS + 1) {
@@ -42,7 +81,7 @@ object IcsFetcher {
 
             try {
                 when (val code = connection.responseCode) {
-                    in 200..299 -> return@runCatching connection.read()
+                    in 200..299 -> return connection.read()
 
                     // `instanceFollowRedirects` ne suit pas HTTP vers HTTPS :
                     // on s'en charge, c'est justement le cas des vieux ENT.

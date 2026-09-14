@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    À qui l'application fait confiance pour un abonnement en HTTPS.
+
+    Le magasin de certificats d'Android est figé à la version du système : un
+    appareil qui ne reçoit plus de mise à jour ignore les autorités reconnues
+    depuis. C'est le cas de HARICA TLS Root CA 2021, devenue en 2024 la racine
+    de GÉANT TCS — donc celle de la quasi-totalité des ENT d'universités
+    européennes. L'ENT n'a rien de mal configuré ; c'est le téléphone qui ne
+    connaît pas encore l'autorité, et la synchronisation échouait sur un
+    « Trust anchor for certification path not found ».
+
+    Ces racines sont publiques et vérifiées : elles figurent au programme des
+    autorités de Mozilla, et chacune a été confrontée à la chaîne réellement
+    servie par un ENT avant d'entrer ici. Empreintes SHA-256 de @raw/geant_roots :
+
+      HARICA TLS RSA Root CA 2021
+        D9:5D:0E:8E:DA:79:52:5B:F9:BE:B1:1B:14:D2:10:0D
+        :32:94:98:5F:0C:62:D9:FA:BD:9C:D9:99:EC:CB:7B:1D
+      HARICA TLS ECC Root CA 2021
+        3F:99:CC:47:4A:CF:CE:4D:FE:D5:87:94:66:5E:47:8D
+        :15:47:73:9F:2E:78:0F:1B:B4:CA:9B:13:30:97:D4:01
+
+    Elles s'ajoutent au magasin du système, elles ne le remplacent pas : tout le
+    reste continue d'être validé comme avant, et rien n'est désactivé. Le fichier
+    PEM ne contient que les deux blocs de certificat, sans commentaire : c'est
+    `CertificateFactory` qui le lit, et on ne lui demande pas d'en ignorer.
+-->
+<network-security-config>
+    <base-config>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/geant_roots" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

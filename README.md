@@ -120,7 +120,17 @@ champ — l'application télécharge avant de demander quoi que ce soit, pour qu
 se signale tout de suite et pas trois heures plus tard.
 
 L'abonnement par URL — `https://` comme `webcal://` — se retélécharge ensuite tout seul à
-l'intervalle choisi, sous contrainte de réseau, par WorkManager. Après chaque synchronisation, le cœur compare
+l'intervalle choisi, sous contrainte de réseau, par WorkManager.
+
+À ce sujet, une ruée sur laquelle on trébuche forcément un jour : **le magasin de certificats
+d'Android est figé à la version du système**. Un appareil qui ne reçoit plus de mise à jour ignore
+les autorités reconnues depuis — dont *HARICA TLS Root CA 2021*, devenue en 2024 la racine de
+GÉANT TCS, donc celle de la quasi-totalité des ENT d'universités européennes. La synchronisation
+échouait alors sur un `Trust anchor for certification path not found` que personne ne peut
+interpréter. Ces deux racines sont donc embarquées dans l'APK et **ajoutées** au magasin du
+système par `res/xml/network_security_config.xml` : rien n'est désactivé, tout le reste continue
+d'être validé comme avant. Les échecs réseau, eux, sont traduits avant d'être montrés : un nom de
+classe Java n'a jamais aidé personne à retrouver son emploi du temps. Après chaque synchronisation, le cœur compare
 l'avant et l'après **en appariant les séances par UID** : une séance qui garde le sien a été
 déplacée, pas supprimée puis recréée. C'est la différence entre « ton TD d'Analyse passe du mardi
 13:30 au mardi 15:00 » et deux notifications illisibles.
@@ -218,6 +228,7 @@ retélécharger l'adresse d'abonnement fournie par l'utilisateur ; rien d'autre 
 | **3** ✅ | Couleurs par champ de l'export, règles visuelles, renommage et masquage |
 | **4** ✅ | Événements saisis sur place, moteur de chevauchements, liste de choses à faire reportable |
 | **4.1** ✅ | Import qui annonce ce qu'il remplace, choix « repartir de zéro », source exclusive |
+| **4.2** ✅ | Racines GÉANT/HARICA embarquées, échecs réseau traduits en français |
 | **5** | Devoirs et notes rattachés à un cours, widget, finitions, puis portage iOS sur le même cœur |
 
 ## Licence
