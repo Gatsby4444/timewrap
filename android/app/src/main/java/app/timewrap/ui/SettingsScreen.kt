@@ -4,6 +4,7 @@ import android.Manifest
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -19,9 +20,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -33,8 +36,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.timewrap.UiState
+import app.timewrap.core.ImportMode
+import app.timewrap.core.ReplacePlan
 import app.timewrap.core.Settings
 import java.time.Instant
 import java.time.LocalTime
@@ -107,10 +113,28 @@ fun SettingsScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                     )
+                    if (settings.sourceUrl.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = settings.sourceUrl,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(onClick = onImportFile) { Text("Fichier .ics") }
-                        OutlinedButton(onClick = { subscribing = true }) { Text("Adresse URL") }
+                        OutlinedButton(onClick = { subscribing = true }) {
+                            Text(
+                                if (settings.sourceUrl.isBlank()) {
+                                    "Adresse URL"
+                                } else {
+                                    "Changer l'adresse"
+                                },
+                            )
+                        }
                     }
                     if (state.timetable != null) {
                         Row {
@@ -349,6 +373,82 @@ fun SettingsScreen(
     }
 }
 
+/**
+ * La question posée avant qu'un nouvel import n'écrase l'emploi du temps.
+ *
+ * Elle ne se pose qu'à partir du deuxième import, et elle ne porte que sur une
+ * chose : ce qui a été fait par-dessus le flux. Les phrases viennent du cœur,
+ * qui seul sait combien de séances, de couleurs et de créneaux sont en jeu.
+ */
+@Composable
+fun ReplaceDialog(
+    plan: ReplacePlan,
+    onDismiss: () -> Unit,
+    onConfirm: (ImportMode) -> Unit,
+) {
+    var mode by remember { mutableStateOf(ImportMode.KEEP) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Remplacer l'emploi du temps ?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    text = "En place : « ${plan.name} » — ${plan.currentSource} · " +
+                        "${plan.eventCount} cours · ${plan.occurrenceCount} séances.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                )
+
+                HorizontalDivider()
+
+                ModeChoice(
+                    title = "Remplacer le contenu",
+                    detail = plan.keepSummary,
+                    selected = mode == ImportMode.KEEP,
+                ) { mode = ImportMode.KEEP }
+
+                ModeChoice(
+                    title = "Repartir de zéro",
+                    detail = plan.freshSummary,
+                    selected = mode == ImportMode.FRESH,
+                ) { mode = ImportMode.FRESH }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(mode) }) {
+                Text(if (mode == ImportMode.KEEP) "Remplacer" else "Tout écraser")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } },
+    )
+}
+
+@Composable
+private fun ModeChoice(
+    title: String,
+    detail: String,
+    selected: Boolean,
+    onSelect: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onSelect),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        RadioButton(selected = selected, onClick = onSelect)
+        Column(Modifier.padding(top = 12.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+            )
+        }
+    }
+}
+
 @Composable
 private fun SwitchRow(
     title: String,
@@ -405,8 +505,10 @@ private fun SubscribeDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "Collez l'adresse d'export iCalendar de votre ENT. " +
-                        "Les adresses webcal:// fonctionnent aussi.",
+                    text = "Collez l'adresse d'export iCalendar de votre ENT — celle " +
+                        "qu'il propose à côté du téléchargement du fichier. " +
+                        "L'emploi du temps se remettra à jour tout seul à partir " +
+                        "d'elle. Les adresses webcal:// fonctionnent aussi.",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 OutlinedTextField(
@@ -429,7 +531,11 @@ private fun SubscribeDialog(
 
 private fun describe(state: UiState, settings: Settings): String {
     val timetable = state.timetable ?: return "Importez un fichier .ics, ou abonnez-vous à une URL."
-    val source = if (settings.sourceUrl.isNotBlank()) "abonnement" else "fichier importé"
+    val source = if (settings.sourceUrl.isNotBlank()) {
+        if (settings.syncEnabled) "abonnement, mis à jour tout seul" else "abonnement"
+    } else {
+        "fichier importé"
+    }
     val counts = "${timetable.eventCount} cours · ${timetable.occurrenceCount} séances"
     val sync = timetable.lastSync?.let {
         "à jour le " + Instant.ofEpochSecond(it).atZone(deviceZone).format(syncFormat)

@@ -69,6 +69,7 @@ import app.timewrap.ui.DayScreen
 import app.timewrap.ui.EventEditor
 import app.timewrap.ui.NowScreen
 import app.timewrap.ui.PropertyValuesScreen
+import app.timewrap.ui.ReplaceDialog
 import app.timewrap.ui.RulesScreen
 import app.timewrap.ui.SectionLabel
 import app.timewrap.ui.SettingsScreen
@@ -184,7 +185,7 @@ private fun TimewrapRoot(
     ) { uri ->
         uri?.let { chosen ->
             readIcs(chosen)?.let { (name, text) ->
-                model.importIcs(name, chosen.toString(), text)
+                model.importFile(name, chosen.toString(), text)
             }
         }
     }
@@ -196,7 +197,7 @@ private fun TimewrapRoot(
 
     LaunchedEffect(pendingImport) {
         pendingImport?.let { uri ->
-            readIcs(uri)?.let { (name, text) -> model.importIcs(name, uri.toString(), text) }
+            readIcs(uri)?.let { (name, text) -> model.importFile(name, uri.toString(), text) }
             onPendingHandled()
         }
     }
@@ -370,6 +371,17 @@ private fun TimewrapRoot(
                 onDismiss = { overlay = null },
             )
         }
+    }
+
+    // Un import arrive de partout — l'onglet des réglages, ou un .ics ouvert
+    // depuis une autre application : la question se pose donc ici, au-dessus de
+    // la vue courante quelle qu'elle soit.
+    state.pendingImport?.let { pending ->
+        ReplaceDialog(
+            plan = pending.plan,
+            onDismiss = model::cancelImport,
+            onConfirm = model::confirmImport,
+        )
     }
 
     // L'arbitrage passe au-dessus de tout : le cœur a refusé d'écrire, il faut

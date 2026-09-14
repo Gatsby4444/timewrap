@@ -11,10 +11,12 @@ import app.timewrap.core.Conflict
 import app.timewrap.core.ConflictPair
 import app.timewrap.core.DayAgenda
 import app.timewrap.core.EventDraft
+import app.timewrap.core.ImportMode
 import app.timewrap.core.NowView
 import app.timewrap.core.Occurrence
 import app.timewrap.core.PropertyKey
 import app.timewrap.core.PropertyValue
+import app.timewrap.core.ReplacePlan
 import app.timewrap.core.Resolution
 import app.timewrap.core.Rule
 import app.timewrap.core.RuleSuggestion
@@ -43,6 +45,9 @@ private const val PRELOAD_RADIUS = 21L
 /** Profondeur du gestionnaire de conflits, en jours. */
 private const val CONFLICT_HORIZON = 60L
 
+/** Nom donné à un emploi du temps dont on ne sait rien d'autre. */
+private const val DEFAULT_NAME = "Emploi du temps"
+
 /**
  * Un enregistrement suspendu par un chevauchement.
  *
@@ -52,6 +57,21 @@ private const val CONFLICT_HORIZON = 60L
 data class PendingSave(
     val draft: EventDraft,
     val conflicts: List<Conflict>,
+)
+
+/**
+ * Un import prêt à écrire, suspendu le temps d'une question.
+ *
+ * Le flux est déjà en main — fichier lu, ou adresse téléchargée — et le cœur a
+ * dit ce que son écriture remplacerait. On ne demande donc jamais de confirmer
+ * quelque chose qui échouera ensuite faute de réseau ou de fichier lisible.
+ */
+data class PendingImport(
+    val name: String,
+    val kind: CalendarKind,
+    val source: String,
+    val text: String,
+    val plan: ReplacePlan,
 )
 
 data class UiState(
@@ -78,6 +98,8 @@ data class UiState(
     /// Message éphémère : bilan d'import ou erreur.
     val message: String? = null,
     val pendingSave: PendingSave? = null,
+    /// Un import qui attend que l'on tranche entre remplacer et repartir de zéro.
+    val pendingImport: PendingImport? = null,
 ) {
     fun day(epochDay: Long): DayAgenda? = days[epochDay]
 
@@ -113,6 +135,10 @@ class AppViewModel(
 
     init {
         refresh()
+        // WorkManager oublie ce qu'on ne lui redemande pas, et un nettoyage
+        // système peut emporter la planification sans rien dire. La reposer au
+        // démarrage coûte une écriture, et évite un abonnement devenu muet.
+        launchCore { SyncScheduler.apply(context, core.settings()) }
     }
 
     /** Recharge ce qui est affiché. */
@@ -136,8 +162,77 @@ class AppViewModel(
 
     // ------------------------------------------------------- emploi du temps
 
-    fun importIcs(name: String, source: String, text: String) = launchCore {
-        val report = core.importIcs(name, CalendarKind.ICS_FILE, source, text)
+    /** Un fichier choisi : on demande d'abord ce qu'il doit faire de l'ancien. */
+    fun importFile(name: String, source: String, text: String) = launchCore {
+        stage(name, CalendarKind.ICS_FILE, source, text)
+    }
+
+    /**
+     * Une adresse d'abonnement : on la télécharge avant de poser la question.
+     *
+     * Dans cet ordre, une adresse fautive se signale tout de suite, et la
+     * question de remplacer ne se pose que si elle a une réponse utile.
+     */
+    fun subscribe(url: String) = launchCore {
+        val address = url.trim()
+        val text = IcsFetcher.fetch(address).getOrElse { error ->
+            _state.update {
+                it.copy(message = "Abonnement impossible : ${error.message ?: "erreur réseau"}")
+            }
+            return@launchCore
+        }
+        val name = core.timetable()?.name ?: DEFAULT_NAME
+        stage(name, CalendarKind.ICS_URL, address, text)
+    }
+
+    /**
+     * Demande, ou écrit tout de suite.
+     *
+     * Au premier import il n'y a rien à remplacer : le cœur rend un plan vide,
+     * et une question sans enjeu est une question de trop.
+     */
+    private suspend fun stage(name: String, kind: CalendarKind, source: String, text: String) {
+        when (val plan = core.replacePlan(kind, source)) {
+            null -> commit(name, kind, source, text, ImportMode.KEEP)
+            else -> _state.update {
+                it.copy(pendingImport = PendingImport(name, kind, source, text, plan))
+            }
+        }
+    }
+
+    fun confirmImport(mode: ImportMode) = launchCore {
+        val pending = _state.value.pendingImport ?: return@launchCore
+        _state.update { it.copy(pendingImport = null) }
+        val name = if (mode == ImportMode.FRESH && pending.kind == CalendarKind.ICS_URL) {
+            DEFAULT_NAME
+        } else {
+            pending.name
+        }
+        commit(name, pending.kind, pending.source, pending.text, mode)
+    }
+
+    fun cancelImport() = _state.update { it.copy(pendingImport = null) }
+
+    /**
+     * Écrit l'emploi du temps, et aligne la source sur ce qui vient d'arriver.
+     *
+     * L'abonnement s'allume ici pour une URL ; le cœur se charge de l'éteindre
+     * pour un fichier, parce que décider qu'une source en chasse une autre est
+     * une décision métier.
+     */
+    private suspend fun commit(
+        name: String,
+        kind: CalendarKind,
+        source: String,
+        text: String,
+        mode: ImportMode,
+    ) {
+        if (kind == CalendarKind.ICS_URL) {
+            val settings = core.settings()
+            core.updateSettings(settings.copy(sourceUrl = source, syncEnabled = true))
+        }
+
+        val report = core.importIcs(name, kind, source, text, mode)
         val today = core.today()
         _state.update {
             it.copy(
@@ -148,13 +243,6 @@ class AppViewModel(
             )
         }
         afterTimetableChanged(today)
-    }
-
-    /** Enregistre une adresse d'abonnement et la télécharge dans la foulée. */
-    fun subscribe(url: String) = launchCore {
-        val settings = core.settings()
-        core.updateSettings(settings.copy(sourceUrl = url.trim(), syncEnabled = true))
-        syncNowInternal(announce = true)
     }
 
     fun syncNow() = launchCore { syncNowInternal(announce = true) }
@@ -173,8 +261,16 @@ class AppViewModel(
             return
         }
 
-        val name = core.timetable()?.name ?: "Emploi du temps"
-        val report = core.importIcs(name, CalendarKind.ICS_URL, settings.sourceUrl, text)
+        val name = core.timetable()?.name ?: DEFAULT_NAME
+        val report = core.importIcs(
+            name,
+            CalendarKind.ICS_URL,
+            settings.sourceUrl,
+            text,
+            // Une resynchronisation n'est pas un changement de source : elle
+            // réécrit les séances du flux, et ne touche à rien d'autre.
+            ImportMode.KEEP,
+        )
 
         if (announce && settings.notifyChanges && report.changes.isNotEmpty()) {
             Notifications.ensureChannels(context)

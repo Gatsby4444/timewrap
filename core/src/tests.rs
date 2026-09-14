@@ -11,7 +11,9 @@ use chrono::{TimeZone, Utc};
 use chrono_tz::Europe::Paris;
 
 use crate::ics;
-use crate::model::{CalendarKind, EventDraft, EventOrigin, Resolution, Rule, RuleField, RuleMatch};
+use crate::model::{
+    CalendarKind, EventDraft, EventOrigin, ImportMode, Resolution, Rule, RuleField, RuleMatch,
+};
 use crate::properties;
 use crate::store::Store;
 
@@ -231,6 +233,7 @@ fn store_with_fixture() -> Store {
             CalendarKind::IcsFile,
             "ent_ade.ics",
             FIXTURE,
+            ImportMode::Keep,
             now(),
         )
         .expect("import");
@@ -262,6 +265,7 @@ fn import_puis_reimport_laisse_le_meme_etat() {
             CalendarKind::IcsFile,
             "ent_ade.ics",
             FIXTURE,
+            ImportMode::Keep,
             now(),
         )
         .expect("réimport");
@@ -281,7 +285,14 @@ fn il_ny_a_jamais_quun_emploi_du_temps() {
     let premier = store.timetable().unwrap().unwrap();
 
     store
-        .import_ics("Autre", CalendarKind::IcsFile, "autre.ics", FIXTURE, now())
+        .import_ics(
+            "Autre",
+            CalendarKind::IcsFile,
+            "autre.ics",
+            FIXTURE,
+            ImportMode::Keep,
+            now(),
+        )
         .unwrap();
     let second = store.timetable().unwrap().unwrap();
 
@@ -290,6 +301,186 @@ fn il_ny_a_jamais_quun_emploi_du_temps() {
         "réimporter remplace le contenu, pas l'emploi du temps"
     );
     assert_eq!(second.name, "Autre");
+}
+
+/// Deux sources pour un seul emploi du temps, c'est le conflit que l'on veut
+/// rendre impossible : le fichier choisi ne doit pas se faire réécrire par un
+/// abonnement resté actif derrière lui.
+#[test]
+fn importer_un_fichier_coupe_labonnement() {
+    let store = Store::open(":memory:", "Europe/Paris").unwrap();
+    store
+        .import_ics(
+            "ENT",
+            CalendarKind::IcsUrl,
+            "https://ent.example/ical/abc",
+            FIXTURE,
+            ImportMode::Keep,
+            now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.settings().unwrap().source_url,
+        "https://ent.example/ical/abc"
+    );
+
+    store
+        .import_ics(
+            "Fichier",
+            CalendarKind::IcsFile,
+            "ent_ade.ics",
+            FIXTURE,
+            ImportMode::Keep,
+            now(),
+        )
+        .unwrap();
+
+    let settings = store.settings().unwrap();
+    assert!(
+        settings.source_url.is_empty(),
+        "l'abonnement doit être oublié : sinon il réécrirait le fichier"
+    );
+    assert!(!settings.sync_enabled);
+}
+
+#[test]
+fn effacer_lemploi_du_temps_arrete_labonnement() {
+    let store = Store::open(":memory:", "Europe/Paris").unwrap();
+    store
+        .import_ics(
+            "ENT",
+            CalendarKind::IcsUrl,
+            "https://ent.example/ical/abc",
+            FIXTURE,
+            ImportMode::Keep,
+            now(),
+        )
+        .unwrap();
+
+    store.clear_timetable().unwrap();
+
+    assert!(
+        store.settings().unwrap().source_url.is_empty(),
+        "sans cela, la synchronisation suivante ressusciterait l'emploi du temps"
+    );
+}
+
+/// « Écraser » au sens propre : ce qui a été posé sur l'ancien emploi du temps
+/// s'en va avec lui. Les choses à faire, non — elles n'en venaient pas.
+#[test]
+fn repartir_de_zero_efface_les_personnalisations() {
+    let store = store_with_fixture();
+    let ajout = store
+        .save_event(
+            &draft(
+                "Dentiste",
+                paris(2026, 9, 26, 10, 0),
+                paris(2026, 9, 26, 11, 0),
+            ),
+            Resolution::Cancel,
+            now(),
+        )
+        .unwrap()
+        .saved
+        .expect("écrit");
+    store
+        .create_category("TD", "Travaux dirigés", None, now())
+        .unwrap();
+    store.add_task("Rendre le TP", LUNDI, now()).unwrap();
+
+    store
+        .import_ics(
+            "Nouvel export",
+            CalendarKind::IcsFile,
+            "autre.ics",
+            FIXTURE,
+            ImportMode::Fresh,
+            now(),
+        )
+        .unwrap();
+
+    assert!(
+        store.occurrence(&ajout.id).is_err(),
+        "un import « repartir de zéro » n'épargne pas les créneaux saisis ici"
+    );
+    assert!(store.categories().unwrap().is_empty());
+    assert_eq!(
+        store.tasks_for_day(LUNDI, LUNDI).unwrap().len(),
+        1,
+        "les choses à faire ne viennent pas de l'ENT"
+    );
+    assert!(
+        !store
+            .occurrences_between(window().0, window().1)
+            .unwrap()
+            .is_empty(),
+        "le nouvel export doit bien avoir été chargé"
+    );
+}
+
+#[test]
+fn le_plan_de_remplacement_annonce_ce_qui_sera_ecrase() {
+    let store = Store::open(":memory:", "Europe/Paris").unwrap();
+    assert!(
+        store
+            .replace_plan(CalendarKind::IcsFile, "ent_ade.ics")
+            .unwrap()
+            .is_none(),
+        "au premier import, il n'y a rien à remplacer, donc rien à demander"
+    );
+
+    store
+        .import_ics(
+            "ENT",
+            CalendarKind::IcsUrl,
+            "https://ent.example/ical/abc",
+            FIXTURE,
+            ImportMode::Keep,
+            now(),
+        )
+        .unwrap();
+    store
+        .save_event(
+            &draft(
+                "Dentiste",
+                paris(2026, 9, 26, 10, 0),
+                paris(2026, 9, 26, 11, 0),
+            ),
+            Resolution::Cancel,
+            now(),
+        )
+        .unwrap();
+
+    let plan = store
+        .replace_plan(CalendarKind::IcsFile, "ent_ade.ics")
+        .unwrap()
+        .expect("un emploi du temps est en place");
+
+    assert_eq!(plan.name, "ENT");
+    assert_eq!(plan.current_source, "abonnement");
+    assert_eq!(plan.local_events, 1);
+    assert!(plan.occurrence_count > 0);
+    assert!(
+        plan.drops_subscription,
+        "passer au fichier abandonne l'abonnement, et il faut le dire"
+    );
+    assert!(plan.keep_summary.contains("ENT"));
+    assert!(plan.fresh_summary.contains("zéro"));
+    for phrase in [&plan.keep_summary, &plan.fresh_summary] {
+        assert!(
+            !phrase.contains("  "),
+            "ces phrases s'affichent telles quelles : {phrase:?}"
+        );
+    }
+
+    let meme_url = store
+        .replace_plan(CalendarKind::IcsUrl, "https://ent.example/ical/abc")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !meme_url.drops_subscription,
+        "resynchroniser la même adresse n'abandonne rien"
+    );
 }
 
 #[test]
@@ -360,6 +551,7 @@ fn un_evenement_saisi_survit_a_un_reimport() {
             CalendarKind::IcsFile,
             "ent_ade.ics",
             FIXTURE,
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -499,6 +691,7 @@ fn une_couleur_par_champ_survit_a_un_reimport() {
             CalendarKind::IcsFile,
             "ent_ade.ics",
             FIXTURE,
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -815,6 +1008,7 @@ fn une_seance_masquee_le_reste_apres_reimport() {
             CalendarKind::IcsFile,
             "ent_ade.ics",
             FIXTURE,
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -969,6 +1163,7 @@ fn store_with(text: &str) -> Store {
             CalendarKind::IcsUrl,
             "https://ent/edt.ics",
             text,
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -984,6 +1179,7 @@ fn un_premier_import_nannonce_pas_de_changement() {
             CalendarKind::IcsUrl,
             "https://ent/edt.ics",
             &one_course(10, "C204", false),
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -1003,6 +1199,7 @@ fn un_cours_deplace_est_annonce_en_clair() {
             CalendarKind::IcsUrl,
             "https://ent/edt.ics",
             &one_course(14, "C204", false),
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -1024,6 +1221,7 @@ fn un_changement_de_salle_est_annonce() {
             CalendarKind::IcsUrl,
             "https://ent/edt.ics",
             &one_course(10, "D101", false),
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -1043,6 +1241,7 @@ fn une_annulation_est_annoncee() {
             CalendarKind::IcsUrl,
             "https://ent/edt.ics",
             &one_course(10, "C204", true),
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -1062,6 +1261,7 @@ fn un_cours_retire_est_annonce() {
             CalendarKind::IcsUrl,
             "https://ent/edt.ics",
             vide,
+            ImportMode::Keep,
             now(),
         )
         .unwrap();
@@ -1079,6 +1279,7 @@ fn un_import_identique_nannonce_rien() {
             CalendarKind::IcsUrl,
             "https://ent/edt.ics",
             &one_course(10, "C204", false),
+            ImportMode::Keep,
             now(),
         )
         .unwrap();

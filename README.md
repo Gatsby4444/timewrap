@@ -44,6 +44,20 @@ changer son identité : les créneaux ajoutés à la main, les séances masquée
 survivent. Ce qui n'a pas d'heure — un devoir, une démarche — n'est pas un créneau et n'a donc
 rien à faire dans un second agenda : c'est une tâche, et elle a sa liste.
 
+Deux calendriers ne peuvent donc jamais se contredire à l'écran, mais encore faut-il le dire :
+à partir du deuxième import, l'application annonce ce qu'elle va écraser — nom de l'emploi du
+temps en place, nombre de séances, ce qui survit — et laisse choisir.
+
+| | |
+|---|---|
+| **Remplacer le contenu** | Les séances du flux laissent la place aux nouvelles ; couleurs, règles, créneaux saisis ici et séances masquées restent. |
+| **Repartir de zéro** | Table rase : l'ancien emploi du temps s'en va avec ses couleurs, ses règles et ses créneaux. Les choses à faire, elles, ne viennent pas de l'ENT et restent. |
+
+La source est **exclusive**, et c'est le cœur qui le décide : importer un fichier coupe
+l'abonnement en place, sans quoi la synchronisation suivante réécrirait par-dessus le fichier
+qu'on vient de choisir. Effacer l'emploi du temps arrête l'abonnement de la même façon — sinon
+la prochaine synchronisation ressusciterait ce qu'on venait d'effacer.
+
 ### Les couleurs viennent des champs de l'export
 
 Un ENT range l'essentiel dans la description, en clair et par lignes :
@@ -100,8 +114,13 @@ et rappelle les séances masquées pour que « Remplacer » reste réversible.
 
 ### Synchronisation et notifications
 
-L'abonnement par URL — `https://` comme `webcal://` — se retélécharge tout seul à l'intervalle
-choisi, sous contrainte de réseau, par WorkManager. Après chaque synchronisation, le cœur compare
+C'est le mode d'emploi normal d'un ENT : à côté du bouton qui télécharge le `.ics`, il publie
+une adresse d'export permanente. Collée dans *Réglages → Adresse URL*, elle est vérifiée sur-le-
+champ — l'application télécharge avant de demander quoi que ce soit, pour qu'une adresse fautive
+se signale tout de suite et pas trois heures plus tard.
+
+L'abonnement par URL — `https://` comme `webcal://` — se retélécharge ensuite tout seul à
+l'intervalle choisi, sous contrainte de réseau, par WorkManager. Après chaque synchronisation, le cœur compare
 l'avant et l'après **en appariant les séances par UID** : une séance qui garde le sien a été
 déplacée, pas supprimée puis recréée. C'est la différence entre « ton TD d'Analyse passe du mardi
 13:30 au mardi 15:00 » et deux notifications illisibles.
@@ -142,8 +161,9 @@ WinLibs en tête avant de lancer les tests :
 export PATH="$LOCALAPPDATA/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin:$PATH"
 ```
 
-`cargo check` n'est pas concerné — il ne lie pas —, et Gradle non plus, qui compile pour les ABI
-Android via `cargo-ndk`.
+`cargo check` n'est pas concerné : il ne lie pas. Gradle, si — il compile bien pour les ABI
+Android via `cargo-ndk`, mais `generateUniffiBindings` construit d'abord `uniffi-bindgen` **pour
+la machine hôte**. Mettre WinLibs en tête du `PATH` vaut donc aussi pour `./gradlew`.
 
 ## Compiler
 
@@ -197,6 +217,7 @@ retélécharger l'adresse d'abonnement fournie par l'utilisateur ; rien d'autre 
 | **2** ✅ | Abonnement par URL, synchronisation automatique, notifications de changement, rappels |
 | **3** ✅ | Couleurs par champ de l'export, règles visuelles, renommage et masquage |
 | **4** ✅ | Événements saisis sur place, moteur de chevauchements, liste de choses à faire reportable |
+| **4.1** ✅ | Import qui annonce ce qu'il remplace, choix « repartir de zéro », source exclusive |
 | **5** | Devoirs et notes rattachés à un cours, widget, finitions, puis portage iOS sur le même cœur |
 
 ## Licence

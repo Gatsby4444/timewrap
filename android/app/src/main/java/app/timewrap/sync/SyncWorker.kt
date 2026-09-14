@@ -10,6 +10,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import app.timewrap.TimewrapApp
 import app.timewrap.core.CalendarKind
+import app.timewrap.core.ImportMode
 import app.timewrap.core.Settings
 import app.timewrap.core.SyncReport
 import app.timewrap.notify.Notifications
@@ -47,6 +48,9 @@ class SyncWorker(context: Context, params: WorkerParameters) :
                 CalendarKind.ICS_URL,
                 settings.sourceUrl,
                 text,
+                // Une synchronisation réécrit les séances du flux et rien
+                // d'autre : couleurs, règles et créneaux saisis ici restent.
+                ImportMode.KEEP,
             )
         }.getOrElse { return@withContext Result.failure() }
 

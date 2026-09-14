@@ -59,6 +59,46 @@ impl EventOrigin {
     }
 }
 
+/// Ce qu'un nouvel import fait de l'emploi du temps en place.
+///
+/// La question ne se pose qu'à partir du deuxième import, et elle ne porte pas
+/// sur les séances — celles du flux sont réécrites dans les deux cas — mais sur
+/// ce qui a été fait par-dessus : couleurs, règles, créneaux saisis ici.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ImportMode {
+    /// Remplace les séances venues du flux et conserve le reste.
+    Keep,
+    /// Repart de zéro : couleurs, règles, créneaux saisis et masquages compris.
+    Fresh,
+}
+
+/// Ce que l'import à venir écraserait, décrit avant de l'écrire.
+///
+/// Rendu par [`crate::Timewrap::replace_plan`] pour que l'interface pose la
+/// question avec les bons chiffres, sans avoir à les recalculer ni à deviner ce
+/// que « remplacer » veut dire ici.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReplacePlan {
+    /// Nom de l'emploi du temps en place.
+    pub name: String,
+    /// D'où il vient, en clair : « abonnement » ou « fichier importé ».
+    pub current_source: String,
+    pub event_count: u32,
+    pub occurrence_count: u32,
+    /// Créneaux saisis dans l'application, que « Remplacer » conserve.
+    pub local_events: u32,
+    /// Couleurs et règles posées à la main, que « Remplacer » conserve.
+    pub customisations: u32,
+    /// Séances masquées à la main, que « Remplacer » conserve.
+    pub muted: u32,
+    /// Vrai si un abonnement actif s'arrête au profit de la nouvelle source.
+    pub drops_subscription: bool,
+    /// Phrase prête à lire : ce que fait « Remplacer ».
+    pub keep_summary: String,
+    /// Phrase prête à lire : ce que fait « Repartir de zéro ».
+    pub fresh_summary: String,
+}
+
 /// L'emploi du temps : sa source, sa dernière mise à jour, sa taille.
 ///
 /// Il n'y en a qu'un. Réimporter un fichier ou resynchroniser une URL remplace

@@ -27,9 +27,9 @@ mod tests;
 pub use error::TimewrapError;
 pub use model::{
     CalendarKind, Category, Change, ChangeKind, Conflict, ConflictPair, DayAgenda, EventDraft,
-    EventOrigin, ImportReport, NowView, Occurrence, PropertyKey, PropertyValue, Reminder,
-    Resolution, Rule, RuleField, RuleMatch, RuleSuggestion, SaveOutcome, Settings, SyncReport,
-    Task, Timetable,
+    EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey, PropertyValue,
+    Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion, SaveOutcome,
+    Settings, SyncReport, Task, Timetable,
 };
 
 use std::sync::{Arc, Mutex};
@@ -82,20 +82,33 @@ impl Timewrap {
         self.store()?.timetable()
     }
 
+    /// Ce qu'un import remplacerait, à demander avant de l'écrire.
+    ///
+    /// Rend `None` quand il n'y a encore rien : la question ne se pose pas, et
+    /// l'interface enchaîne directement sur l'import.
+    pub fn replace_plan(&self, kind: CalendarKind, source: String) -> Result<Option<ReplacePlan>> {
+        self.store()?.replace_plan(kind, &source)
+    }
+
     /// Charge un `.ics` : premier import, ou remplacement du contenu.
     ///
-    /// L'identité de l'emploi du temps ne change pas : les séances ajoutées à la
-    /// main, les masquages et les couleurs survivent. Le rapport dit ce qui a
-    /// bougé depuis la version précédente.
+    /// En [`ImportMode::Keep`], l'identité de l'emploi du temps ne change pas :
+    /// les séances ajoutées à la main, les masquages et les couleurs survivent.
+    /// En [`ImportMode::Fresh`], l'ancien emploi du temps est écrasé pour de
+    /// bon. Le rapport dit ce qui a bougé depuis la version précédente.
+    ///
+    /// Un import de fichier coupe l'abonnement en place : deux sources ne
+    /// peuvent pas alimenter le même emploi du temps sans se contredire.
     pub fn import_ics(
         &self,
         name: String,
         kind: CalendarKind,
         source: String,
         ics_text: String,
+        mode: ImportMode,
     ) -> Result<SyncReport> {
         self.store()?
-            .import_ics(&name, kind, &source, &ics_text, now())
+            .import_ics(&name, kind, &source, &ics_text, mode, now())
     }
 
     pub fn rename_timetable(&self, name: String) -> Result<()> {
@@ -106,7 +119,8 @@ impl Timewrap {
         self.store()?.set_color(color)
     }
 
-    /// Oublie l'emploi du temps. Les choses à faire ne bougent pas.
+    /// Oublie l'emploi du temps, abonnement compris. Les choses à faire ne
+    /// bougent pas.
     pub fn clear_timetable(&self) -> Result<()> {
         self.store()?.clear_timetable()
     }

@@ -19,9 +19,9 @@ use crate::error::{Result, TimewrapError};
 use crate::ics;
 use crate::model::{
     CalendarKind, Category, Change, ChangeKind, Conflict, ConflictPair, DayAgenda, EventDraft,
-    EventOrigin, ImportReport, NowView, Occurrence, PropertyKey, PropertyValue, Reminder,
-    Resolution, Rule, RuleField, RuleMatch, RuleSuggestion, SaveOutcome, Settings, SyncReport,
-    Task, Timetable,
+    EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey, PropertyValue,
+    Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion, SaveOutcome,
+    Settings, SyncReport, Task, Timetable,
 };
 use crate::properties::{self, Property};
 use crate::rules;
@@ -324,17 +324,31 @@ impl Store {
 
     /// Installe ou remplace le contenu de l'emploi du temps.
     ///
-    /// L'identité de l'emploi du temps ne change jamais : réimporter un fichier
-    /// ou resynchroniser une URL réécrit les séances venues du flux, et laisse
-    /// intactes celles ajoutées ici, les masquages et les personnalisations.
+    /// En mode [`ImportMode::Keep`], l'identité de l'emploi du temps ne change
+    /// jamais : réimporter un fichier ou resynchroniser une URL réécrit les
+    /// séances venues du flux, et laisse intactes celles ajoutées ici, les
+    /// masquages et les personnalisations. En mode [`ImportMode::Fresh`], tout
+    /// ce qui tenait à l'ancien emploi du temps est effacé d'abord — c'est
+    /// « écraser » au sens propre, et seules les choses à faire y survivent,
+    /// puisqu'elles ne viennent pas de l'ENT.
+    ///
+    /// La source est exclusive : un import de fichier coupe l'abonnement en
+    /// place, faute de quoi la synchronisation suivante réécrirait par-dessus le
+    /// fichier qu'on vient de choisir. C'était le seul moyen qu'avaient deux
+    /// calendriers de se disputer l'écran.
     pub fn import_ics(
         &self,
         name: &str,
         kind: CalendarKind,
         source: &str,
         ics_text: &str,
+        mode: ImportMode,
         now_utc: i64,
     ) -> Result<SyncReport> {
+        if mode == ImportMode::Fresh {
+            self.wipe()?;
+        }
+
         let id = match self.timetable()? {
             Some(existing) => {
                 self.conn.execute(
@@ -366,8 +380,15 @@ impl Store {
             "UPDATE calendars SET raw_ics = ?2 WHERE id = ?1",
             params![id, ics_text],
         )?;
-        if kind == CalendarKind::IcsUrl {
-            self.set_setting("source_url", source)?;
+        // Une seule source à la fois : on enregistre celle-ci, et on oublie
+        // l'autre. Un abonnement laissé actif derrière un import de fichier
+        // reviendrait écraser ce fichier à la synchronisation suivante.
+        match kind {
+            CalendarKind::IcsUrl => self.set_setting("source_url", source)?,
+            CalendarKind::IcsFile => {
+                self.set_setting("source_url", "")?;
+                self.set_setting("sync_enabled", "0")?;
+            }
         }
 
         let before = self.diff_snapshot(now_utc)?;
@@ -394,9 +415,86 @@ impl Store {
 
     /// Efface l'emploi du temps et tout ce qui en dépend. Les tâches restent :
     /// elles ne viennent pas de l'ENT.
+    ///
+    /// L'abonnement s'arrête avec lui : sans cela, la prochaine synchronisation
+    /// ferait réapparaître ce que l'on vient d'effacer.
     pub fn clear_timetable(&self) -> Result<()> {
         self.conn.execute("DELETE FROM calendars", [])?;
+        self.set_setting("source_url", "")?;
+        self.set_setting("sync_enabled", "0")?;
         Ok(())
+    }
+
+    /// Table rase, avant un import qui repart de zéro.
+    ///
+    /// Les catégories et les règles partent avec les séances : elles décrivent
+    /// un emploi du temps qui n'existe plus. Les choses à faire restent, elles
+    /// n'ont jamais appartenu au flux.
+    fn wipe(&self) -> Result<()> {
+        self.transact(|| {
+            self.conn.execute("DELETE FROM calendars", [])?;
+            self.conn.execute("DELETE FROM rules", [])?;
+            self.conn.execute("DELETE FROM categories", [])?;
+            Ok(())
+        })
+    }
+
+    /// Ce qu'un nouvel import écraserait, décrit avant de l'écrire.
+    ///
+    /// Rend `None` au premier import : il n'y a alors rien à remplacer, donc
+    /// aucune question à poser. L'interface ne compte rien et ne rédige rien —
+    /// elle affiche ce plan, et rappelle avec la décision.
+    pub fn replace_plan(&self, kind: CalendarKind, source: &str) -> Result<Option<ReplacePlan>> {
+        let Some(timetable) = self.timetable()? else {
+            return Ok(None);
+        };
+
+        let local_events = self.count("SELECT COUNT(*) FROM occurrences WHERE origin = 'local'")?;
+        let muted = self.count("SELECT COUNT(*) FROM occurrences WHERE muted = 1")?;
+        let customisations = self.count("SELECT COUNT(*) FROM categories")?
+            + self.count("SELECT COUNT(*) FROM rules")?;
+
+        // Changer de source est le geste qui fait basculer d'un calendrier à
+        // l'autre : c'est là qu'il faut prévenir, pas au réimport de la même.
+        let subscribed = self.get_setting("source_url")?.unwrap_or_default();
+        let drops_subscription = !subscribed.trim().is_empty()
+            && (kind == CalendarKind::IcsFile || subscribed.trim() != source.trim());
+
+        let abandon = if drops_subscription {
+            " L'abonnement en place s'arrête au profit de cette source."
+        } else {
+            ""
+        };
+
+        Ok(Some(ReplacePlan {
+            keep_summary: format!(
+                "Les {} séances de « {} » laissent la place à celles de cette source.{}{}",
+                timetable.occurrence_count,
+                timetable.name,
+                kept_phrase(local_events, customisations, muted),
+                abandon,
+            ),
+            fresh_summary: format!(
+                "Tout repart de zéro : séances, couleurs, règles et créneaux \
+                 ajoutés ici. Vos choses à faire, elles, restent.{}",
+                abandon,
+            ),
+            name: timetable.name,
+            current_source: match timetable.kind {
+                CalendarKind::IcsUrl => "abonnement".to_string(),
+                CalendarKind::IcsFile => "fichier importé".to_string(),
+            },
+            event_count: timetable.event_count,
+            occurrence_count: timetable.occurrence_count,
+            local_events,
+            customisations,
+            muted,
+            drops_subscription,
+        }))
+    }
+
+    fn count(&self, sql: &str) -> Result<u32> {
+        Ok(self.conn.query_row(sql, [], |row| row.get::<_, i64>(0))? as u32)
     }
 
     /// Développe le flux et réécrit les séances importées.
@@ -1896,6 +1994,25 @@ impl Snapshot {
     /// Vrai si cette séance retrouve son exact équivalent dans une liste.
     fn matched(&self, others: &[Snapshot]) -> bool {
         others.iter().any(|o| o.same_slot(self))
+    }
+}
+
+/// Ce qu'un remplacement laisse debout, en une phrase ou rien du tout.
+fn kept_phrase(local_events: u32, customisations: u32, muted: u32) -> String {
+    let mut parts = Vec::new();
+    if local_events > 0 {
+        parts.push(format!("{local_events} créneau(x) ajouté(s) ici"));
+    }
+    if customisations > 0 {
+        parts.push(format!("{customisations} couleur(s) et règle(s)"));
+    }
+    if muted > 0 {
+        parts.push(format!("{muted} séance(s) masquée(s)"));
+    }
+    match parts.len() {
+        0 => String::new(),
+        1 => format!(" Vos {} restent.", parts[0]),
+        _ => format!(" Restent : {}.", parts.join(", ")),
     }
 }
 
