@@ -15,32 +15,37 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TimePicker
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import app.timewrap.core.BlockStyle
+import app.timewrap.core.colorPalette
 import java.time.LocalTime
 
 /**
- * La palette du cœur, répétée ici pour les sélecteurs de couleur.
+ * La palette, demandée au cœur.
  *
- * Les deux listes doivent rester identiques : c'est le cœur qui attribue une
- * couleur par défaut, l'interface qui permet d'en changer.
+ * Avant, elle était recopiée ici : deux listes qui devaient rester identiques
+ * sans que rien ne le garantisse. Il n'y en a plus qu'une.
  */
-val PALETTE: List<UInt> = listOf(
-    0xFF4C5FD5u, 0xFF2E9E7Au, 0xFFD2694Bu, 0xFF8155C6u,
-    0xFF3C87C8u, 0xFFC2528Au, 0xFF7A8A3Cu, 0xFFB08236u,
-)
+val PALETTE: List<UInt> by lazy { colorPalette() }
+
+/** Pastilles par ligne dans les sélecteurs. */
+private const val SWATCHES_PER_ROW = 6
 
 /** Une boîte à un seul champ de texte — création, renommage. */
 @Composable
@@ -70,7 +75,7 @@ fun TextPromptDialog(
 }
 
 /**
- * Huit pastilles : assez pour distinguer, trop peu pour hésiter.
+ * Vingt-quatre pastilles, et une couleur libre pour le reste.
  *
  * `onClear` n'apparaît que là où retirer la couleur a un sens — une valeur de
  * champ colorée peut redevenir neutre, la couleur de l'emploi du temps non.
@@ -82,18 +87,33 @@ fun ColorPickerDialog(
     onDismiss: () -> Unit,
     onPick: (UInt) -> Unit,
     onClear: (() -> Unit)? = null,
+    style: BlockStyle? = null,
+    onStyle: ((BlockStyle) -> Unit)? = null,
 ) {
+    var custom by remember { mutableStateOf(false) }
+    // Le style se choisit sans fermer la boîte : on compare d'un coup d'œil.
+    var shownStyle by remember(style) { mutableStateOf(style) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                PALETTE.chunked(4).forEach { row ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        row.forEach { color ->
-                            ColorDot(color, color == current) { onPick(color) }
-                        }
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (shownStyle != null && onStyle != null) {
+                    Text("Style", style = MaterialTheme.typography.labelMedium)
+                    StylePicker(
+                        current = shownStyle!!,
+                        accent = Color((current ?: PALETTE.first()).toInt()),
+                    ) {
+                        shownStyle = it
+                        onStyle(it)
                     }
+                    Text("Couleur", style = MaterialTheme.typography.labelMedium)
+                }
+                if (custom) {
+                    FreeColorPicker(initial = current ?: PALETTE.first(), onPick = onPick)
+                } else {
+                    SwatchGrid(current = current, onPick = onPick)
+                    TextButton(onClick = { custom = true }) { Text("Autre couleur…") }
                 }
             }
         },
@@ -104,6 +124,59 @@ fun ColorPickerDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Fermer") } },
     )
+}
+
+/** Toute la palette, rangée en lignes égales. */
+@Composable
+fun SwatchGrid(current: UInt?, size: Int = 34, onPick: (UInt) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        PALETTE.chunked(SWATCHES_PER_ROW).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                row.forEach { color ->
+                    ColorDot(color, color == current, size = size) { onPick(color) }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Une couleur au choix : teinte, intensité, luminosité.
+ *
+ * La luminosité est bornée : trop claire, la couleur disparaîtrait sur le fond
+ * éclairci d'un bloc et l'intitulé deviendrait illisible.
+ */
+@Composable
+private fun FreeColorPicker(initial: UInt, onPick: (UInt) -> Unit) {
+    val start = remember(initial) {
+        FloatArray(3).also { android.graphics.Color.colorToHSV(initial.toInt(), it) }
+    }
+    var hue by remember { mutableFloatStateOf(start[0]) }
+    var saturation by remember { mutableFloatStateOf(start[1].coerceIn(0.25f, 1f)) }
+    var value by remember { mutableFloatStateOf(start[2].coerceIn(0.3f, 0.85f)) }
+    val color = android.graphics.Color.HSVToColor(floatArrayOf(hue, saturation, value)).toUInt()
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ColorDot(color, selected = false, size = 44) {}
+            Box(
+                Modifier
+                    .padding(start = 12.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(color.toInt()).copy(alpha = 0.24f))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                Text("Aperçu d'un cours", fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Text("Teinte", style = MaterialTheme.typography.labelMedium)
+        Slider(value = hue, onValueChange = { hue = it }, valueRange = 0f..359f)
+        Text("Intensité", style = MaterialTheme.typography.labelMedium)
+        Slider(value = saturation, onValueChange = { saturation = it }, valueRange = 0.25f..1f)
+        Text("Luminosité", style = MaterialTheme.typography.labelMedium)
+        Slider(value = value, onValueChange = { value = it }, valueRange = 0.3f..0.85f)
+        TextButton(onClick = { onPick(color) }) { Text("Choisir cette couleur") }
+    }
 }
 
 @Composable

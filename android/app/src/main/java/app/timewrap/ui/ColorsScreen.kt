@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -33,9 +34,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.timewrap.UiState
+import app.timewrap.core.BlockStyle
 import app.timewrap.core.PropertyKey
 import app.timewrap.core.PropertyValue
 
@@ -168,6 +171,8 @@ fun PropertyValuesScreen(
     onPick: (String, UInt) -> Unit,
     onClear: (String) -> Unit,
     onAutoColor: () -> Unit,
+    onStyle: (String, BlockStyle) -> Unit,
+    onAutoStyle: () -> Unit,
     onBack: () -> Unit,
 ) {
     var editing by remember { mutableStateOf<PropertyValue?>(null) }
@@ -204,6 +209,16 @@ fun PropertyValuesScreen(
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                 )
                 Spacer(Modifier.height(6.dp))
+                OutlinedButton(onClick = onAutoStyle, modifier = Modifier.fillMaxWidth()) {
+                    Text("Un style par valeur")
+                }
+                Text(
+                    text = "Plein, rayé, contour, pointillé : CM plein, TD rayé, TP en contour. " +
+                        "Idéal sur le type de cours, pendant que la couleur dit la matière.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                )
+                Spacer(Modifier.height(6.dp))
             }
 
             items(values, key = { it.value }) { value ->
@@ -229,6 +244,8 @@ fun PropertyValuesScreen(
             } else {
                 null
             },
+            style = value.style,
+            onStyle = { onStyle(value.value, it) },
         )
     }
 }
@@ -246,11 +263,10 @@ private fun PropertyValueRow(value: PropertyValue, onClick: () -> Unit) {
             Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            ColorDot(
-                color = value.color,
-                selected = false,
-                size = 28,
-                onClick = onClick,
+            Box(
+                Modifier
+                    .size(width = 34.dp, height = 26.dp)
+                    .blockSurface(value.style, Color(value.color.toInt())),
             )
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
@@ -263,6 +279,7 @@ private fun PropertyValueRow(value: PropertyValue, onClick: () -> Unit) {
                     text = buildString {
                         append("${value.occurrences} séance(s)")
                         if (!value.colored) append(" · sans couleur propre")
+                        if (value.style != BlockStyle.SOLID) append(" · ${value.style.label().lowercase()}")
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),

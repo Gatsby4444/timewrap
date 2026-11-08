@@ -163,6 +163,8 @@ pub struct PropertyValue {
     /// Couleur effective : celle de la catégorie, ou celle de l'emploi du temps.
     pub color: u32,
     pub colored: bool,
+    /// Style posé sur cette valeur ; `Solid` tant que rien n'est choisi.
+    pub style: BlockStyle,
 }
 
 /// Le champ d'une séance sur lequel une règle se prononce.
@@ -268,6 +270,40 @@ pub(crate) struct RuleOutcome {
     pub hidden: bool,
 }
 
+/// Comment un bloc se dessine dans la grille.
+///
+/// La couleur dit déjà la matière ; le style dit autre chose — le plus souvent
+/// le type de cours. Deux indices indépendants se lisent ensemble : « bleu
+/// rayé » est un TD d'Analyse. Et un motif se voit sans distinguer les
+/// couleurs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum BlockStyle {
+    Solid,
+    Stripes,
+    Outline,
+    Dots,
+}
+
+impl BlockStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockStyle::Solid => "solid",
+            BlockStyle::Stripes => "stripes",
+            BlockStyle::Outline => "outline",
+            BlockStyle::Dots => "dots",
+        }
+    }
+
+    pub fn parse(value: &str) -> BlockStyle {
+        match value {
+            "stripes" => BlockStyle::Stripes,
+            "outline" => BlockStyle::Outline,
+            "dots" => BlockStyle::Dots,
+            _ => BlockStyle::Solid,
+        }
+    }
+}
+
 /// Une séance concrète : un cours à une date et une heure précises.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Occurrence {
@@ -294,6 +330,12 @@ pub struct Occurrence {
     /// Étiquette courte de la catégorie, vide si aucune.
     pub category_label: String,
     pub hidden: bool,
+    /// Style du bloc, posé par la valeur d'un champ (« Type : TD » → rayé).
+    pub style: BlockStyle,
+    /// Une épreuve : examen, partiel, DS… reconnue dans l'intitulé ou les champs.
+    pub exam: bool,
+    /// Devoirs non faits rattachés à cette séance.
+    pub homework: u32,
 }
 
 impl Occurrence {
@@ -347,6 +389,22 @@ pub struct Task {
     /// Jours de retard à la date consultée, zéro si elle est à sa place.
     pub days_late: i64,
     pub position: i32,
+    /// La séance pour laquelle c'est un devoir ; absente pour une tâche libre.
+    pub course: Option<TaskCourse>,
+}
+
+/// La séance à laquelle un devoir est rattaché, telle qu'on l'a vue en dernier.
+///
+/// Gardée en clair à côté du lien : si l'ENT retire la séance, le devoir dit
+/// encore pour quel cours il était.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TaskCourse {
+    /// Absent quand la séance a disparu de l'emploi du temps.
+    pub occurrence_id: Option<String>,
+    pub title: String,
+    pub start_utc: i64,
+    pub end_utc: i64,
+    pub location: String,
 }
 
 /// Bilan d'une importation.

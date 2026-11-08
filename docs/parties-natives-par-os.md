@@ -2,7 +2,7 @@
 
 Tout ce qui ne vit pas dans `core/` (Rust, partagé) et devra donc être réécrit en Swift pour iOS.
 Mis à jour à chaque fichier Kotlin ajouté, supprimé ou renommé, et vérifié en fin de session
-(règle du `CLAUDE.md`). Dernière vérification : 2026-11-08, v0.6.0.
+(règle du `CLAUDE.md`). Dernière vérification : 2026-11-09, v0.7.0.
 
 ## Capacités système
 
@@ -30,11 +30,10 @@ Compose : à refaire en SwiftUI, sans aucune règle métier à réécrire (elles
 | À faire | `ui/TasksScreen.kt` |
 | Réglages | `ui/SettingsScreen.kt` |
 | Historique des changements | `ui/HistoryScreen.kt` |
-| Couleurs, règles | `ui/ColorsScreen.kt`, `ui/RulesScreen.kt` |
+| Couleurs, styles, règles | `ui/ColorsScreen.kt`, `ui/RulesScreen.kt`, `ui/BlockStyles.kt` (dessin des styles : plein, rayé, contour, pointillé ; cadre d'épreuve) |
+| Fiche d'une séance et ses devoirs | `MainActivity.kt` (`OccurrenceDetail`, `HomeworkSection`) |
 | Chevauchements | `ui/ConflictsScreen.kt` |
 | Éditeur d'événement | `ui/EventEditor.kt` |
 | Composants partagés, formats | `ui/Common.kt`, `ui/Format.kt`, `ui/theme/Theme.kt` |
 
-⚠️ Dette connue : la palette de couleurs est recopiée dans `ui/Common.kt` alors que le cœur a
-la sienne (`core/src/store.rs`, `PALETTE`). Deux copies d'une même donnée : à faire servir par le
-cœur, sans quoi iOS en ferait une troisième.
+La palette n'existe que dans le cœur (`color_palette()`) : l'interface iOS la demandera de même.

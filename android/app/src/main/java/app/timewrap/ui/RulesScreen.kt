@@ -1,8 +1,6 @@
 package app.timewrap.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -421,16 +419,7 @@ private fun CategoryEditorDialog(
                 )
                 if (initial != null) {
                     Text("Couleur", style = MaterialTheme.typography.labelMedium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        PALETTE.take(4).forEach { swatch ->
-                            ColorDot(swatch, swatch == color) { color = swatch }
-                        }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        PALETTE.drop(4).forEach { swatch ->
-                            ColorDot(swatch, swatch == color) { color = swatch }
-                        }
-                    }
+                    SwatchGrid(current = color, size = 30) { color = it }
                 }
             }
         },
@@ -438,22 +427,6 @@ private fun CategoryEditorDialog(
             TextButton(onClick = { onConfirm(name, label, color) }) { Text("Enregistrer") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } },
-    )
-}
-
-@Composable
-private fun ColorDot(color: UInt, selected: Boolean, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .size(36.dp)
-            .clip(CircleShape)
-            .background(Color(color.toInt()))
-            .border(
-                width = if (selected) 3.dp else 0.dp,
-                color = MaterialTheme.colorScheme.onSurface,
-                shape = CircleShape,
-            )
-            .clickable(onClick = onClick),
     )
 }
 

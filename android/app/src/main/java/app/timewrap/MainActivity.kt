@@ -10,6 +10,14 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.ui.text.style.TextDecoration
+import app.timewrap.ui.ExamBadge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -193,7 +201,6 @@ private fun TimewrapRoot(
     val liveConflicts by model.draftConflicts.collectAsState()
     var tab by remember { mutableStateOf(Tab.Now) }
     var overlay by remember { mutableStateOf<Overlay?>(null) }
-    var detail by remember { mutableStateOf<Occurrence?>(null) }
     var editingTask by remember { mutableStateOf<Task?>(null) }
     val snackbar = remember { SnackbarHostState() }
 
@@ -289,20 +296,20 @@ private fun TimewrapRoot(
                     state = state,
                     onImport = { tab = Tab.Settings },
                     onOpenHistory = { overlay = Overlay.History },
-                    onSelect = { detail = it },
+                    onSelect = model::openCourse,
                     onOpenTasks = { tab = Tab.Tasks },
                 )
 
                 Tab.Day -> DayScreen(
                     state,
                     onSelectDay = model::selectDay,
-                    onSelect = { detail = it },
+                    onSelect = model::openCourse,
                 )
 
                 Tab.Week -> WeekScreen(
                     state,
                     onSelectWeek = model::selectWeek,
-                    onSelect = { detail = it },
+                    onSelect = model::openCourse,
                 )
 
                 Tab.Tasks -> TasksScreen(
@@ -364,6 +371,8 @@ private fun TimewrapRoot(
                 },
                 onClear = { value -> model.clearPropertyColor(current.key.key, value) },
                 onAutoColor = { model.autoColorProperty(current.key.key) },
+                onStyle = { value, style -> model.setPropertyStyle(current.key.key, value, style) },
+                onAutoStyle = { model.autoStyleProperty(current.key.key) },
                 onBack = { overlay = Overlay.Colors },
             )
         }
@@ -448,23 +457,31 @@ private fun TimewrapRoot(
         )
     }
 
-    detail?.let { occurrence ->
+    state.course?.let { sheet ->
+        val occurrence = sheet.occurrence
         ModalBottomSheet(
-            onDismissRequest = { detail = null },
-            sheetState = rememberModalBottomSheetState(),
+            onDismissRequest = model::closeCourse,
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         ) {
             OccurrenceDetail(
                 occurrence = occurrence,
                 state = state,
                 onEdit = {
-                    detail = null
+                    model.closeCourse()
                     overlay = Overlay.Editor(draftOf(occurrence))
                 },
                 onMute = {
-                    detail = null
+                    model.closeCourse()
                     model.setMuted(occurrence.id, true)
                 },
                 onCategory = { model.setOccurrenceCategory(occurrence.id, it) },
+                homework = {
+                    HomeworkSection(
+                        sheet = sheet,
+                        onAdd = model::addHomework,
+                        onToggle = model::setHomeworkDone,
+                    )
+                },
             )
         }
     }
@@ -477,10 +494,12 @@ private fun OccurrenceDetail(
     onEdit: () -> Unit,
     onMute: () -> Unit,
     onCategory: (String?) -> Unit,
+    homework: @Composable () -> Unit,
 ) {
     Column(
         Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(start = 24.dp, end = 24.dp, bottom = 40.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -491,7 +510,9 @@ private fun OccurrenceDetail(
                 color = Color(occurrence.color.toInt()),
                 modifier = Modifier.weight(1f),
             )
-            if (occurrence.categoryLabel.isNotBlank()) {
+            if (occurrence.exam) {
+                ExamBadge(Color(occurrence.color.toInt()))
+            } else if (occurrence.categoryLabel.isNotBlank()) {
                 CategoryChip(occurrence.categoryLabel, Color(occurrence.color.toInt()))
             }
         }
@@ -513,6 +534,11 @@ private fun OccurrenceDetail(
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.error,
             )
+        }
+
+        if (!occurrence.allDay) {
+            Spacer(Modifier.height(16.dp))
+            homework()
         }
 
         if (occurrence.location.isNotBlank()) {
@@ -550,5 +576,99 @@ private fun OccurrenceDetail(
             }
             TextButton(onClick = onMute) { Text("Masquer") }
         }
+    }
+}
+
+/**
+ * Les devoirs d'une séance, et la place pour en noter un.
+ *
+ * Le cas le plus courant en sortant d'un cours : « pour la prochaine fois, faire
+ * les exercices 3 à 5 ». Le bouton principal vise donc la prochaine séance du
+ * même cours — c'est le cœur qui sait laquelle — et le devoir s'y range, au bon
+ * jour. Le second bouton garde la possibilité de le rattacher à celle-ci.
+ */
+@Composable
+private fun HomeworkSection(
+    sheet: CourseSheet,
+    onAdd: (String, String) -> Unit,
+    onToggle: (String, Boolean) -> Unit,
+) {
+    var text by remember(sheet.occurrence.id) { mutableStateOf("") }
+    val next = sheet.next
+
+    SectionLabel("Devoirs")
+    if (sheet.homework.isEmpty() && sheet.loaded) {
+        Text(
+            text = "Rien à faire pour cette séance.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+        )
+    }
+    sheet.homework.forEach { task -> HomeworkLine(task, onToggle) }
+
+    OutlinedTextField(
+        value = text,
+        onValueChange = { text = it },
+        placeholder = { Text("Noter un devoir…") },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp),
+    )
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(top = 6.dp),
+    ) {
+        if (next != null) {
+            Button(
+                enabled = text.isNotBlank(),
+                onClick = {
+                    onAdd(text, next.id)
+                    text = ""
+                },
+            ) { Text("Pour le prochain cours") }
+        }
+        OutlinedButton(
+            enabled = text.isNotBlank(),
+            onClick = {
+                onAdd(text, sheet.occurrence.id)
+                text = ""
+            },
+        ) { Text("Pour cette séance") }
+    }
+
+    if (next != null) {
+        Text(
+            text = "Prochain cours : " + next.startUtc.toLocalDate().longLabel() +
+                ", " + next.timeRange() +
+                if (next.location.isNotBlank()) " · ${next.location}" else "",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            modifier = Modifier.padding(top = 6.dp),
+        )
+        sheet.nextHomework.forEach { task -> HomeworkLine(task, onToggle) }
+    } else if (sheet.loaded) {
+        Text(
+            text = "Pas d'autre séance de ce cours à l'emploi du temps.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            modifier = Modifier.padding(top = 6.dp),
+        )
+    }
+}
+
+@Composable
+private fun HomeworkLine(task: Task, onToggle: (String, Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = task.done, onCheckedChange = { onToggle(task.id, it) })
+        Text(
+            text = task.title,
+            style = MaterialTheme.typography.bodyMedium,
+            textDecoration = if (task.done) TextDecoration.LineThrough else null,
+            color = if (task.done) {
+                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+            } else {
+                MaterialTheme.colorScheme.onSurface
+            },
+        )
     }
 }

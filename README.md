@@ -7,7 +7,7 @@ quoi après ?*
 Elle lit les exports **iCalendar** d'un ENT — fichier `.ics` ou URL d'abonnement — et les
 restitue dans une interface mobile, hors-ligne, sans compte ni serveur.
 
-> État : **phases 1 à 4** livrées. L'emploi du temps se charge par fichier ou par abonnement, se
+> État : **phases 1 à 4, et 5.0** livrées. L'emploi du temps se charge par fichier ou par abonnement, se
 > resynchronise tout seul et prévient de ce qui change. Les couleurs se règlent par champ de
 > l'export — une par type de cours, une par matière. Une liste de choses à faire, sans heure,
 > accompagne chaque journée et se reporte tant qu'elle n'est pas cochée. Rappels avant les cours
@@ -79,6 +79,20 @@ Sous le capot, chaque couleur est une catégorie et la règle qui la pose — ma
 vu qu'une pastille. Ces règles s'appliquent aussi à ce qui arrive **ensuite** : un nouveau TD
 importé le mois prochain prend sa couleur sans rien redemander.
 
+La palette compte **24 couleurs**, plus une couleur libre (teinte, intensité, luminosité,
+bornées pour que l'intitulé reste lisible). Elle n'existe qu'une fois, dans le cœur : l'interface
+la lui demande.
+
+La couleur ne suffit pas à tout dire : une séance n'a qu'une catégorie, donc une couleur — en
+général celle de la matière. Le **style** du bloc dit le reste, indépendamment : *plein*, *rayé*,
+*contour*, *pointillé*, posé par valeur de champ. « Un style par valeur » sur le champ Type donne
+d'un geste un CM plein, un TD rayé, un TP en contour : « bleu rayé » se lit « TD d'Analyse », et
+le motif se voit même sans distinguer les couleurs.
+
+Les **épreuves** — examen, partiel, DS, contrôle, QCM, soutenance… — sont reconnues par le cœur
+dans l'intitulé ou les champs (par mot entier : « DS » oui, « ADSL » non) et reçoivent un cadre
+épais et une pastille « EXAMEN », quel que soit leur style.
+
 Pour ce que les champs ne couvrent pas, les **règles avancées** restent accessibles : reconnaître
 un mot dans l'intitulé, renommer (« ★ {} » préfixe sans retaper), masquer. Elles se cumulent dans
 l'ordre de priorité, et chacune n'écrase que ce qu'elle renseigne. L'intitulé de l'ENT est
@@ -94,6 +108,13 @@ tant qu'une tâche n'est pas cochée, elle reste due.
 
 Une journée passée ou à venir ne montre que ce qui lui était propre — sans quoi la vue Semaine
 répéterait sept fois la même liste.
+
+Une tâche peut être un **devoir rattaché à un cours**. Depuis la fiche d'une séance, « Pour le
+prochain cours » range le devoir à la prochaine séance du même cours — même intitulé, même type :
+le TD d'Analyse suit le TD d'Analyse, pas le CM — et c'est le cœur qui la trouve. Le bloc de la
+séance porte une pastille ✎ tant qu'il reste des devoirs, et la liste dit pour quel cours chacun
+est. Si l'ENT déplace la séance, le devoir la suit (même UID, une semaine d'écart au plus) ; si
+elle disparaît, le devoir reste et dit pour quel cours il était.
 
 ### Le moteur de chevauchements
 
@@ -236,7 +257,8 @@ retélécharger l'adresse d'abonnement fournie par l'utilisateur ; rien d'autre 
 | **4.1** ✅ | Import qui annonce ce qu'il remplace, choix « repartir de zéro », source exclusive |
 | **4.2** ✅ | Racines GÉANT/HARICA embarquées, échecs réseau traduits en français |
 | **4.3** ✅ | Historique des changements avec l'avant et l'après, notifications dépliables une par changement, navigation Jour / Semaine fiabilisée |
-| **5** | Devoirs et notes rattachés à un cours, widget, finitions, puis portage iOS sur le même cœur |
+| **5.0** ✅ | 24 couleurs et couleur libre, styles de blocs par champ, épreuves mises en avant, devoirs rattachés à un cours et « pour le prochain cours » |
+| **5** | Widget, finitions, puis portage iOS sur le même cœur |
 
 ## Licence
 

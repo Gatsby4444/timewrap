@@ -229,6 +229,20 @@ private fun TaskRow(
                         MaterialTheme.colorScheme.onSurface
                     },
                 )
+                task.course?.let { course ->
+                    // Un devoir dit pour quel cours il est : c'est ce qu'on
+                    // cherche en le relisant.
+                    Text(
+                        text = buildString {
+                            append("Pour ${course.title} · ")
+                            append(course.startUtc.toLocalDate().shortLabel())
+                            append(", ${course.startUtc.formatTime()}")
+                            if (course.occurrenceId == null) append(" · plus à l'emploi du temps")
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
                 lateLabel(task)?.let { late ->
                     Text(
                         text = late,

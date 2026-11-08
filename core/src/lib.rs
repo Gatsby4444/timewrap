@@ -15,6 +15,7 @@ uniffi::setup_scaffolding!();
 
 mod conflict;
 mod error;
+mod exam;
 mod ics;
 mod model;
 mod properties;
@@ -26,10 +27,10 @@ mod tests;
 
 pub use error::TimewrapError;
 pub use model::{
-    CalendarKind, Category, Change, ChangeEntry, ChangeKind, ChangeSlot, Conflict, ConflictPair,
-    DayAgenda, EventDraft, EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey,
-    PropertyValue, Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion,
-    SaveOutcome, Settings, SyncReport, Task, Timetable,
+    BlockStyle, CalendarKind, Category, Change, ChangeEntry, ChangeKind, ChangeSlot, Conflict,
+    ConflictPair, DayAgenda, EventDraft, EventOrigin, ImportMode, ImportReport, NowView,
+    Occurrence, PropertyKey, PropertyValue, Reminder, ReplacePlan, Resolution, Rule, RuleField,
+    RuleMatch, RuleSuggestion, SaveOutcome, Settings, SyncReport, Task, TaskCourse, Timetable,
 };
 
 use std::sync::{Arc, Mutex};
@@ -248,6 +249,17 @@ impl Timewrap {
         self.store()?.auto_color_property(&key, now())
     }
 
+    /// Donne un style de bloc à une valeur de champ ; `Solid` retire le choix.
+    pub fn set_property_style(&self, key: String, value: String, style: BlockStyle) -> Result<()> {
+        self.store()?.set_property_style(&key, &value, style)
+    }
+
+    /// Un style par valeur du champ, d'un seul geste (CM plein, TD rayé, TP
+    /// en contour…). Rend le nombre de styles posés.
+    pub fn auto_style_property(&self, key: String) -> Result<u32> {
+        self.store()?.auto_style_property(&key)
+    }
+
     pub fn categories(&self) -> Result<Vec<Category>> {
         self.store()?.categories()
     }
@@ -352,6 +364,23 @@ impl Timewrap {
         self.store()?.delete_task(&id)
     }
 
+    /// Un devoir à faire pour une séance donnée.
+    pub fn add_homework(&self, title: String, occurrence_id: String) -> Result<Task> {
+        self.store()?.add_homework(&title, &occurrence_id, now())
+    }
+
+    /// La prochaine séance du même cours, pour y noter un devoir.
+    pub fn next_session(&self, occurrence_id: String) -> Result<Option<Occurrence>> {
+        self.store()?.next_session(&occurrence_id)
+    }
+
+    /// Les devoirs rattachés à une séance, faits compris.
+    pub fn homework_for(&self, occurrence_id: String) -> Result<Vec<Task>> {
+        let store = self.store()?;
+        let today = store.epoch_day_of(now())?;
+        store.homework_for(&occurrence_id, today)
+    }
+
     // ------------------------------------------------------ rappels et réglages
 
     /// Les rappels à programmer sur l'appareil, du plus proche au plus lointain.
@@ -405,6 +434,14 @@ pub struct SelfTest {
     pub rules: u32,
     pub properties: u32,
     pub pending_tasks: u32,
+}
+
+/// Les couleurs proposées par les sélecteurs, dans l'ordre.
+///
+/// L'interface n'en garde pas de copie : une seule liste, ici.
+#[uniffi::export]
+pub fn color_palette() -> Vec<u32> {
+    store::PALETTE.to_vec()
 }
 
 /// Version de la crate, telle que déclarée dans `Cargo.toml`.

@@ -16,12 +16,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::conflict;
 use crate::error::{Result, TimewrapError};
+use crate::exam;
 use crate::ics;
 use crate::model::{
-    CalendarKind, Category, Change, ChangeEntry, ChangeKind, ChangeSlot, Conflict, ConflictPair,
-    DayAgenda, EventDraft, EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey,
-    PropertyValue, Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion,
-    SaveOutcome, Settings, SyncReport, Task, Timetable,
+    BlockStyle, CalendarKind, Category, Change, ChangeEntry, ChangeKind, ChangeSlot, Conflict,
+    ConflictPair, DayAgenda, EventDraft, EventOrigin, ImportMode, ImportReport, NowView,
+    Occurrence, PropertyKey, PropertyValue, Reminder, ReplacePlan, Resolution, Rule, RuleField,
+    RuleMatch, RuleSuggestion, SaveOutcome, Settings, SyncReport, Task, TaskCourse, Timetable,
 };
 use crate::properties::{self, Property};
 use crate::rules;
@@ -45,8 +46,15 @@ const CHANGE_LOG_RETENTION: Duration = Duration::days(120);
 /// Au-delà, les plus anciens changements laissent la place.
 const CHANGE_LOG_MAX: i64 = 1000;
 
-/// Couleurs attribuées aux catégories dans l'ordre de création.
-pub const PALETTE: [u32; 8] = [
+/// Couleurs proposées, et attribuées aux catégories dans l'ordre de création.
+///
+/// Les huit premières sont celles des versions précédentes, dans le même
+/// ordre : un emploi du temps déjà colorié garde ses couleurs. Les seize
+/// suivantes couvrent le reste du cercle des teintes, assez sombres pour qu'un
+/// intitulé reste lisible sur leur fond éclairci.
+///
+/// C'est la seule copie : l'interface la demande au cœur.
+pub const PALETTE: [u32; 24] = [
     0xFF4C5FD5, // bleu-violet
     0xFF2E9E7A, // vert
     0xFFD2694B, // terre cuite
@@ -55,6 +63,22 @@ pub const PALETTE: [u32; 8] = [
     0xFFC2528A, // framboise
     0xFF7A8A3C, // olive
     0xFFB08236, // ambre
+    0xFFE04848, // rouge
+    0xFFE8862A, // orange
+    0xFFCFA81E, // moutarde
+    0xFF6BAF3A, // vert pomme
+    0xFF3E8E4F, // vert sapin
+    0xFF1F9AA6, // turquoise
+    0xFF2BB5D8, // cyan
+    0xFF2D5FA8, // bleu marine
+    0xFF5A48B0, // indigo
+    0xFFA13DC4, // pourpre
+    0xFFE0559E, // rose
+    0xFF9C3B4A, // bordeaux
+    0xFF8A5A3C, // brun
+    0xFF5E7D6A, // sauge
+    0xFF6F7F96, // gris bleu
+    0xFF4A4A4A, // anthracite
 ];
 
 /// Couleur de l'emploi du temps quand rien n'a encore été personnalisé.
@@ -70,7 +94,12 @@ const OCC_COLUMNS: &str = "o.id, COALESCE(cat.color, c.color), o.uid,
      o.summary, o.location, o.description, o.start_utc, o.end_utc, o.all_day,
      o.cancelled, o.origin, o.category_id, COALESCE(cat.name, ''),
      COALESCE(cat.label, ''),
-     CASE WHEN o.hidden = 1 OR o.muted = 1 THEN 1 ELSE 0 END";
+     CASE WHEN o.hidden = 1 OR o.muted = 1 THEN 1 ELSE 0 END,
+     COALESCE((SELECT st.style FROM occurrence_props p
+               JOIN property_styles st ON st.key = p.key AND st.value = p.value COLLATE NOCASE
+               WHERE p.occurrence_id = o.id ORDER BY st.rowid LIMIT 1), 'solid'),
+     o.exam,
+     (SELECT COUNT(*) FROM tasks t WHERE t.course_occurrence = o.id AND t.done = 0)";
 
 const OCC_FROM: &str = "FROM occurrences o
      JOIN calendars c ON c.id = o.calendar_id
@@ -259,6 +288,39 @@ impl Store {
 
                  PRAGMA user_version = 4;",
             )?;
+        }
+
+        // v5 : styles de blocs, épreuves, devoirs rattachés à un cours.
+        //
+        // Le style vit à part des catégories : une séance n'a qu'une catégorie
+        // — donc qu'une couleur, en général celle de la matière —, alors que
+        // son type de cours doit rester lisible en même temps.
+        //
+        // Un devoir garde en clair le cours qu'il vise, à côté du lien : une
+        // séance déplacée par l'ENT change d'identifiant, et il faut pouvoir la
+        // retrouver ; une séance retirée doit laisser un devoir qui dit encore
+        // pour quoi il était.
+        if version < 5 {
+            self.conn.execute_batch(
+                "ALTER TABLE occurrences ADD COLUMN exam INTEGER NOT NULL DEFAULT 0;
+
+                 CREATE TABLE property_styles (
+                     key   TEXT NOT NULL,
+                     value TEXT NOT NULL COLLATE NOCASE,
+                     style TEXT NOT NULL,
+                     PRIMARY KEY (key, value)
+                 );
+
+                 ALTER TABLE tasks ADD COLUMN course_occurrence TEXT;
+                 ALTER TABLE tasks ADD COLUMN course_uid TEXT;
+                 ALTER TABLE tasks ADD COLUMN course_title TEXT;
+                 ALTER TABLE tasks ADD COLUMN course_start INTEGER;
+                 ALTER TABLE tasks ADD COLUMN course_end INTEGER;
+                 ALTER TABLE tasks ADD COLUMN course_location TEXT;
+                 CREATE INDEX idx_tasks_course ON tasks(course_occurrence);",
+            )?;
+            self.refresh_exam_flags()?;
+            self.conn.execute_batch("PRAGMA user_version = 5;")?;
         }
 
         Ok(())
@@ -480,6 +542,7 @@ impl Store {
             self.conn.execute("DELETE FROM categories", [])?;
             // L'historique raconte un emploi du temps qui n'existe plus.
             self.conn.execute("DELETE FROM change_log", [])?;
+            self.conn.execute("DELETE FROM property_styles", [])?;
             Ok(())
         })
     }
@@ -618,6 +681,8 @@ impl Store {
             self.set_setting("last_sync_utc", &now_utc.to_string())?;
             Ok(())
         })?;
+        self.refresh_exam_flags()?;
+        self.relink_homework()?;
 
         Ok(ImportReport {
             events: expansion.events,
@@ -1146,6 +1211,7 @@ impl Store {
 
         let rules = self.rules_raw()?;
         let categories = self.categories()?;
+        let styles = self.property_styles(&key)?;
 
         Ok(values
             .into_iter()
@@ -1162,11 +1228,16 @@ impl Store {
 
                 PropertyValue {
                     key: key.clone(),
-                    value,
                     occurrences,
                     color: category.as_ref().map(|c| c.color).unwrap_or(default_color),
                     colored: category.is_some(),
                     category_id: category.map(|c| c.id),
+                    style: styles
+                        .iter()
+                        .find(|(v, _)| v.eq_ignore_ascii_case(&value))
+                        .map(|(_, style)| *style)
+                        .unwrap_or(BlockStyle::Solid),
+                    value,
                 }
             })
             .collect())
@@ -1297,6 +1368,7 @@ impl Store {
                 category_id: None,
                 color: default_color,
                 colored: false,
+                style: BlockStyle::Solid,
             }));
         }
         Ok(out)
@@ -1703,6 +1775,8 @@ impl Store {
             ],
         )?;
         self.write_properties(&id, &props)?;
+        self.refresh_exam_flags()?;
+        self.relink_homework()?;
 
         Ok(SaveOutcome {
             saved: Some(self.occurrence(&id)?),
@@ -1956,12 +2030,18 @@ impl Store {
     /// — sans quoi la vue Semaine répéterait sept fois la même chose.
     pub fn tasks_for_day(&self, epoch_day: i64, today: i64) -> Result<Vec<Task>> {
         let sql = if epoch_day == today {
-            "SELECT id, title, notes, planned_day, done, done_day, position
+            "SELECT id, title, notes, planned_day, done, done_day, position,
+                    CASE WHEN EXISTS (SELECT 1 FROM occurrences WHERE id = tasks.course_occurrence)
+                         THEN course_occurrence END,
+                    course_title, course_start, course_end, course_location
              FROM tasks
              WHERE (done = 0 AND planned_day <= ?1) OR done_day = ?1
              ORDER BY done, planned_day, position, rowid"
         } else {
-            "SELECT id, title, notes, planned_day, done, done_day, position
+            "SELECT id, title, notes, planned_day, done, done_day, position,
+                    CASE WHEN EXISTS (SELECT 1 FROM occurrences WHERE id = tasks.course_occurrence)
+                         THEN course_occurrence END,
+                    course_title, course_start, course_end, course_location
              FROM tasks
              WHERE planned_day = ?1 OR done_day = ?1
              ORDER BY done, planned_day, position, rowid"
@@ -1975,7 +2055,10 @@ impl Store {
     /// Tout ce qui reste ouvert, du plus ancien au plus récent.
     pub fn pending_tasks(&self, today: i64) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, notes, planned_day, done, done_day, position
+            "SELECT id, title, notes, planned_day, done, done_day, position,
+                    CASE WHEN EXISTS (SELECT 1 FROM occurrences WHERE id = tasks.course_occurrence)
+                         THEN course_occurrence END,
+                    course_title, course_start, course_end, course_location
              FROM tasks WHERE done = 0 AND planned_day <= ?1
              ORDER BY planned_day, position, rowid",
         )?;
@@ -2052,12 +2135,277 @@ impl Store {
 
     fn task(&self, id: &str, reference_day: i64) -> Result<Task> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, notes, planned_day, done, done_day, position
+            "SELECT id, title, notes, planned_day, done, done_day, position,
+                    CASE WHEN EXISTS (SELECT 1 FROM occurrences WHERE id = tasks.course_occurrence)
+                         THEN course_occurrence END,
+                    course_title, course_start, course_end, course_location
              FROM tasks WHERE id = ?1",
         )?;
         stmt.query_row(params![id], |row| read_task(row, reference_day))
             .optional()?
             .ok_or_else(|| TimewrapError::NotFound(format!("tâche {id}")))
+    }
+
+    // ------------------------------------------------------------ styles
+
+    fn property_styles(&self, key: &str) -> Result<Vec<(String, BlockStyle)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value, style FROM property_styles WHERE key = ?1")?;
+        let rows = stmt.query_map(params![key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                BlockStyle::parse(&row.get::<_, String>(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Donne un style à une valeur de champ — « Type : TD » en rayé.
+    ///
+    /// `Solid` est le style par défaut : le poser revient à retirer le choix,
+    /// et la ligne disparaît plutôt que de répéter le défaut.
+    pub fn set_property_style(&self, key: &str, value: &str, style: BlockStyle) -> Result<()> {
+        let key = properties::normalize(key);
+        if style == BlockStyle::Solid {
+            self.conn.execute(
+                "DELETE FROM property_styles WHERE key = ?1 AND value = ?2",
+                params![key, value],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO property_styles (key, value, style) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key, value) DO UPDATE SET style = excluded.style",
+                params![key, value, style.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Un style par valeur, d'un seul geste.
+    ///
+    /// Les types de cours usuels reçoivent toujours le même — un CM plein, un
+    /// TD rayé, un TP en contour — pour que l'habitude prise sur un emploi du
+    /// temps vaille sur le suivant. Les autres valeurs prennent les styles
+    /// dans l'ordre. Rend le nombre de styles posés.
+    pub fn auto_style_property(&self, key: &str) -> Result<u32> {
+        const CYCLE: [BlockStyle; 4] = [
+            BlockStyle::Solid,
+            BlockStyle::Stripes,
+            BlockStyle::Outline,
+            BlockStyle::Dots,
+        ];
+        let key = properties::normalize(key);
+        let values = self.property_values(&key)?;
+        let mut next = 0usize;
+        let mut set = 0;
+        for value in &values {
+            let style = match properties::normalize(&value.value).as_str() {
+                "cm" | "cours" | "cours magistral" | "amphi" => BlockStyle::Solid,
+                "td" | "travaux diriges" => BlockStyle::Stripes,
+                "tp" | "travaux pratiques" => BlockStyle::Outline,
+                "projet" | "tutorat" | "autre" => BlockStyle::Dots,
+                _ => {
+                    let style = CYCLE[next % CYCLE.len()];
+                    next += 1;
+                    style
+                }
+            };
+            self.set_property_style(&key, &value.value, style)?;
+            set += 1;
+        }
+        Ok(set)
+    }
+
+    // ------------------------------------------------------------ épreuves
+
+    /// Recalcule quelles séances sont des épreuves.
+    ///
+    /// Matérialisé à l'écriture comme le reste : une vue ne calcule rien, elle
+    /// lit. Le calcul porte sur l'intitulé d'origine, l'intitulé affiché et les
+    /// valeurs des champs — « Type : Examen » suffit.
+    fn refresh_exam_flags(&self) -> Result<()> {
+        let rows: Vec<(String, String, String, bool)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, summary, display_title, exam FROM occurrences")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut values_stmt = self
+            .conn
+            .prepare("SELECT value FROM occurrence_props WHERE occurrence_id = ?1")?;
+        let mut update = self
+            .conn
+            .prepare("UPDATE occurrences SET exam = ?2 WHERE id = ?1")?;
+        for (id, summary, display_title, was) in rows {
+            let values: Vec<String> = values_stmt
+                .query_map(params![id], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let now = exam::is_exam(
+                [summary.as_str(), display_title.as_str()]
+                    .into_iter()
+                    .chain(values.iter().map(String::as_str)),
+            );
+            if now != was {
+                update.execute(params![id, now as i64])?;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ devoirs
+
+    /// Un devoir pour une séance précise.
+    ///
+    /// Il se range au jour de la séance : c'est ce jour-là qu'il doit être
+    /// fait, et non coché il reparaît ensuite avec son retard, comme toute
+    /// chose à faire.
+    pub fn add_homework(&self, title: &str, occurrence_id: &str, now_utc: i64) -> Result<Task> {
+        let course = self.occurrence(occurrence_id)?;
+        let planned_day = self.epoch_day_of(course.start_utc)?;
+        let task = self.add_task(title, planned_day, now_utc)?;
+        self.conn.execute(
+            "UPDATE tasks SET course_occurrence = ?2, course_uid = ?3, course_title = ?4,
+                              course_start = ?5, course_end = ?6, course_location = ?7
+             WHERE id = ?1",
+            params![
+                task.id,
+                course.id,
+                course.uid,
+                course.title,
+                course.start_utc,
+                course.end_utc,
+                course.location
+            ],
+        )?;
+        self.task(&task.id, planned_day)
+    }
+
+    /// La prochaine séance du même cours : même intitulé, même type.
+    ///
+    /// « Le même cours » se lit sur l'intitulé affiché et le champ « Type » :
+    /// le TD d'Analyse suit le TD d'Analyse, pas le CM. L'UID ne sert pas — la
+    /// plupart des ENT en donnent un par séance. Une séance annulée ne compte
+    /// pas : on n'y rendra rien.
+    pub fn next_session(&self, occurrence_id: &str) -> Result<Option<Occurrence>> {
+        let current = self.occurrence(occurrence_id)?;
+        let kind = self.course_type(occurrence_id)?;
+        let sql = format!(
+            "SELECT {OCC_COLUMNS} {OCC_FROM}
+             WHERE {VISIBLE} AND o.cancelled = 0 AND o.all_day = 0
+               AND o.start_utc > ?1
+               AND (CASE WHEN o.display_title <> '' THEN o.display_title ELSE o.summary END) = ?2
+               AND COALESCE((SELECT value FROM occurrence_props
+                             WHERE occurrence_id = o.id AND key = 'type'), '') = ?3
+             ORDER BY o.start_utc LIMIT 1"
+        );
+        Ok(self
+            .conn
+            .query_row(
+                &sql,
+                params![current.start_utc, current.title, kind],
+                read_occurrence,
+            )
+            .optional()?)
+    }
+
+    fn course_type(&self, occurrence_id: &str) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM occurrence_props WHERE occurrence_id = ?1 AND key = 'type'",
+                params![occurrence_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Les devoirs d'une séance, faits compris.
+    pub fn homework_for(&self, occurrence_id: &str, today: i64) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, notes, planned_day, done, done_day, position,
+                    CASE WHEN EXISTS (SELECT 1 FROM occurrences WHERE id = tasks.course_occurrence)
+                         THEN course_occurrence END,
+                    course_title, course_start, course_end, course_location
+             FROM tasks WHERE course_occurrence = ?1
+             ORDER BY done, position, rowid",
+        )?;
+        let rows = stmt.query_map(params![occurrence_id], |row| read_task(row, today))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Recolle les devoirs à leur séance après un import.
+    ///
+    /// L'identifiant d'une séance contient son heure : déplacée par l'ENT, elle
+    /// en change. Un devoir orphelin retrouve donc la séance du même UID la
+    /// plus proche de celle qu'il visait (une semaine au plus), et la suit — sa
+    /// date avec, s'il n'est pas encore fait. Sinon il garde ce qu'il savait du
+    /// cours, et dit qu'il n'est plus à l'emploi du temps. Les devoirs encore
+    /// liés reprennent l'intitulé, l'heure et la salle à jour.
+    fn relink_homework(&self) -> Result<()> {
+        const MAX_DRIFT: i64 = 7 * 86_400;
+        let orphans: Vec<(String, String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, course_uid, course_start FROM tasks
+                 WHERE course_occurrence IS NOT NULL AND course_uid IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM occurrences WHERE id = tasks.course_occurrence)",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        for (task_id, uid, start) in orphans {
+            let found: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM occurrences
+                     WHERE uid = ?1 AND ABS(start_utc - ?2) <= ?3
+                     ORDER BY ABS(start_utc - ?2) LIMIT 1",
+                    params![uid, start, MAX_DRIFT],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match found {
+                Some(occurrence_id) => {
+                    let course = self.occurrence(&occurrence_id)?;
+                    let day = self.epoch_day_of(course.start_utc)?;
+                    self.conn.execute(
+                        "UPDATE tasks SET course_occurrence = ?2,
+                             planned_day = CASE WHEN done = 0 THEN ?3 ELSE planned_day END
+                         WHERE id = ?1",
+                        params![task_id, occurrence_id, day],
+                    )?;
+                }
+                None => {
+                    self.conn.execute(
+                        "UPDATE tasks SET course_occurrence = NULL WHERE id = ?1",
+                        params![task_id],
+                    )?;
+                }
+            }
+        }
+
+        self.conn.execute_batch(
+            "UPDATE tasks SET
+                 course_title = (SELECT CASE WHEN o.display_title <> '' THEN o.display_title
+                                             ELSE o.summary END
+                                 FROM occurrences o WHERE o.id = tasks.course_occurrence),
+                 course_start = (SELECT start_utc FROM occurrences o WHERE o.id = tasks.course_occurrence),
+                 course_end = (SELECT end_utc FROM occurrences o WHERE o.id = tasks.course_occurrence),
+                 course_location = (SELECT location FROM occurrences o WHERE o.id = tasks.course_occurrence)
+             WHERE EXISTS (SELECT 1 FROM occurrences o WHERE o.id = tasks.course_occurrence);",
+        )?;
+        Ok(())
     }
 
     // ----------------------------------------------------------------- rappels
@@ -2300,6 +2648,9 @@ fn read_occurrence(row: &rusqlite::Row<'_>) -> rusqlite::Result<Occurrence> {
         category_name: row.get(13)?,
         category_label: row.get(14)?,
         hidden: row.get::<_, i64>(15)? != 0,
+        style: BlockStyle::parse(&row.get::<_, String>(16)?),
+        exam: row.get::<_, i64>(17)? != 0,
+        homework: row.get::<_, i64>(18)? as u32,
     })
 }
 
@@ -2319,6 +2670,19 @@ fn read_task(row: &rusqlite::Row<'_>, reference_day: i64) -> rusqlite::Result<Ta
             (reference_day - planned_day).max(0)
         },
         position: row.get::<_, i64>(6)? as i32,
+        course: match (
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+        ) {
+            (Some(title), Some(start_utc)) => Some(TaskCourse {
+                occurrence_id: row.get(7)?,
+                title,
+                start_utc,
+                end_utc: row.get::<_, Option<i64>>(10)?.unwrap_or(start_utc),
+                location: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+            }),
+            _ => None,
+        },
     })
 }
 

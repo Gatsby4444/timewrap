@@ -1536,3 +1536,161 @@ fn un_import_par_url_retient_ladresse() {
     );
     assert!(store.settings().unwrap().last_sync_utc.is_some());
 }
+
+// ------------------------------------------- styles, épreuves et devoirs
+
+#[test]
+fn la_palette_garde_les_huit_couleurs_dorigine_en_tete() {
+    let palette = crate::color_palette();
+    assert_eq!(palette.len(), 24);
+    assert_eq!(palette[0], 0xFF4C5FD5);
+    assert_eq!(palette[7], 0xFFB08236);
+    let mut unique = palette.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), palette.len(), "aucune couleur en double");
+}
+
+#[test]
+fn le_style_suit_le_type_de_cours_sans_toucher_a_la_couleur() {
+    use crate::model::BlockStyle;
+    let store = store_with(&one_course(10, "C204", false));
+    store
+        .set_property_color("type", "TD", 0xFFE04848, now())
+        .unwrap();
+    assert_eq!(store.auto_style_property("type").unwrap(), 1);
+
+    let seance = &store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 2, 0, 0))
+        .unwrap()[0];
+    assert_eq!(seance.style, BlockStyle::Stripes, "un TD est rayé");
+    assert_eq!(seance.color, 0xFFE04848, "la couleur reste celle choisie");
+
+    let valeurs = store.property_values("type").unwrap();
+    assert_eq!(valeurs[0].style, BlockStyle::Stripes);
+
+    store
+        .set_property_style("type", "TD", BlockStyle::Solid)
+        .unwrap();
+    let seance = &store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 2, 0, 0))
+        .unwrap()[0];
+    assert_eq!(seance.style, BlockStyle::Solid);
+}
+
+#[test]
+fn une_epreuve_est_reconnue_a_limport() {
+    let examen = one_course(10, "C204", false).replace("SUMMARY:Analyse", "SUMMARY:DS Analyse");
+    let store = store_with(&examen);
+    let seance = &store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 2, 0, 0))
+        .unwrap()[0];
+    assert!(seance.exam);
+
+    // Redevenue un cours ordinaire à la synchronisation suivante.
+    resync(&store, &one_course(10, "C204", false), now());
+    let seance = &store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 2, 0, 0))
+        .unwrap()[0];
+    assert!(!seance.exam);
+}
+
+#[test]
+fn un_devoir_se_range_au_jour_de_sa_seance() {
+    let store = store_with(&weekly_course(10, 3));
+    let seances = store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 30, 0, 0))
+        .unwrap();
+    let premiere = &seances[0];
+
+    let devoir = store
+        .add_homework("Exercices 1 à 4", &premiere.id, now())
+        .unwrap();
+    let course = devoir.course.as_ref().expect("rattaché à un cours");
+    assert_eq!(course.occurrence_id.as_deref(), Some(premiere.id.as_str()));
+    assert_eq!(course.title, "Analyse");
+    assert_eq!(
+        devoir.planned_day,
+        store.epoch_day_of(premiere.start_utc).unwrap()
+    );
+
+    let seance = store.occurrence(&premiere.id).unwrap();
+    assert_eq!(seance.homework, 1, "la séance compte son devoir");
+    assert_eq!(store.homework_for(&premiere.id, 0).unwrap().len(), 1);
+
+    store
+        .set_task_done(&devoir.id, true, devoir.planned_day)
+        .unwrap();
+    assert_eq!(store.occurrence(&premiere.id).unwrap().homework, 0);
+}
+
+#[test]
+fn la_prochaine_seance_est_celle_du_meme_cours() {
+    let store = store_with(&weekly_course(10, 3));
+    let seances = store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 30, 0, 0))
+        .unwrap();
+    let suivante = store.next_session(&seances[0].id).unwrap().unwrap();
+    assert_eq!(suivante.id, seances[1].id);
+    assert_eq!(suivante.start_utc, paris(2026, 10, 8, 10, 0));
+
+    let derniere = seances.last().unwrap();
+    assert!(store.next_session(&derniere.id).unwrap().is_none());
+}
+
+#[test]
+fn un_devoir_suit_sa_seance_quand_lent_la_deplace() {
+    let store = store_with(&one_course(10, "C204", false));
+    let seance = store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 2, 0, 0))
+        .unwrap()
+        .remove(0);
+    let devoir = store
+        .add_homework("Lire le chapitre 3", &seance.id, now())
+        .unwrap();
+
+    resync(&store, &one_course(14, "D101", false), now());
+
+    let devoirs = store.pending_tasks(LUNDI + 30).unwrap();
+    let suivi = devoirs.iter().find(|t| t.id == devoir.id).unwrap();
+    let course = suivi.course.as_ref().unwrap();
+    let nouvelle = store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 2, 0, 0))
+        .unwrap()
+        .remove(0);
+    assert_eq!(course.occurrence_id.as_deref(), Some(nouvelle.id.as_str()));
+    assert_eq!(course.start_utc, paris(2026, 10, 1, 14, 0));
+    assert_eq!(course.location, "D101");
+}
+
+#[test]
+fn un_devoir_dont_la_seance_disparait_garde_son_cours() {
+    let store = store_with(&one_course(10, "C204", false));
+    let seance = store
+        .occurrences_between(utc(2026, 10, 1, 0, 0), utc(2026, 10, 2, 0, 0))
+        .unwrap()
+        .remove(0);
+    let devoir = store
+        .add_homework("Rendre le TP", &seance.id, now())
+        .unwrap();
+
+    let vide =
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Timewrap//Test//FR\r\nEND:VCALENDAR\r\n";
+    resync(&store, vide, now());
+
+    let restant = store
+        .pending_tasks(LUNDI + 30)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == devoir.id)
+        .expect("le devoir n'est pas effacé");
+    let course = restant.course.unwrap();
+    assert!(course.occurrence_id.is_none(), "la séance n'existe plus");
+    assert_eq!(course.title, "Analyse");
+}
+
+#[test]
+fn une_majuscule_accentuee_se_normalise() {
+    assert_eq!(properties::normalize("ÉPREUVE Écrite"), "epreuve ecrite");
+    assert_eq!(properties::normalize("MATIÈRE"), "matiere");
+}

@@ -88,7 +88,10 @@ pub fn parse(description: &str) -> Vec<Property> {
 pub fn normalize(text: &str) -> String {
     text.trim()
         .chars()
-        .flat_map(|c| unaccent(c.to_ascii_lowercase()))
+        // `to_lowercase` et non `to_ascii_lowercase` : ce dernier laisse « É »
+        // en majuscule, et « Épreuve » ne valait alors pas « epreuve ».
+        .flat_map(char::to_lowercase)
+        .flat_map(unaccent)
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()

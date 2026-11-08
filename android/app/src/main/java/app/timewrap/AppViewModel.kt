@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import app.timewrap.core.BlockStyle
 import app.timewrap.core.CalendarKind
 import app.timewrap.core.Category
 import app.timewrap.core.ChangeEntry
@@ -77,6 +78,18 @@ data class PendingImport(
     val plan: ReplacePlan,
 )
 
+/**
+ * La fiche d'une séance ouverte : ses devoirs, et la prochaine séance du même
+ * cours avec les siens. Le cœur décide de ce qu'est « la prochaine ».
+ */
+data class CourseSheet(
+    val occurrence: Occurrence,
+    val homework: List<Task> = emptyList(),
+    val next: Occurrence? = null,
+    val nextHomework: List<Task> = emptyList(),
+    val loaded: Boolean = false,
+)
+
 data class UiState(
     val timetable: Timetable? = null,
     val settings: Settings? = null,
@@ -105,6 +118,8 @@ data class UiState(
     val pendingSave: PendingSave? = null,
     /// Un import qui attend que l'on tranche entre remplacer et repartir de zéro.
     val pendingImport: PendingImport? = null,
+    /// La séance dont la fiche est ouverte.
+    val course: CourseSheet? = null,
 ) {
     fun day(epochDay: Long): DayAgenda? = days[epochDay]
 
@@ -447,6 +462,17 @@ class AppViewModel(
         afterColorsChanged(key)
     }
 
+    fun setPropertyStyle(key: String, value: String, style: BlockStyle) = launchCore {
+        core.setPropertyStyle(key, value, style)
+        afterColorsChanged(key)
+    }
+
+    fun autoStyleProperty(key: String) = launchCore {
+        val posees = core.autoStyleProperty(key)
+        _state.update { it.copy(message = "$posees style(s) posé(s).") }
+        afterColorsChanged(key)
+    }
+
     fun autoColorProperty(key: String) = launchCore {
         val posees = core.autoColorProperty(key)
         _state.update { it.copy(message = "$posees couleur(s) posée(s).") }
@@ -514,6 +540,51 @@ class AppViewModel(
         core.deleteCategory(id)
         loadRuleShell()
         reload(_state.value.selectedDay)
+    }
+
+    // ---------------------------------------------------------------- devoirs
+
+    /**
+     * Ouvre la fiche d'une séance : ses devoirs, et la séance suivante du même
+     * cours, pour pouvoir y noter quelque chose tout de suite.
+     */
+    fun openCourse(occurrence: Occurrence) {
+        _state.update { it.copy(course = CourseSheet(occurrence)) }
+        launchCore(showBusy = false) { loadCourse(occurrence.id) }
+    }
+
+    fun closeCourse() = _state.update { it.copy(course = null) }
+
+    /** Un devoir pour cette séance-ci, ou pour la suivante du même cours. */
+    fun addHomework(title: String, occurrenceId: String) = launchCore {
+        core.addHomework(title, occurrenceId)
+        val open = _state.value.course?.occurrence?.id
+        open?.let { loadCourse(it) }
+        reload(_state.value.selectedDay)
+    }
+
+    fun setHomeworkDone(id: String, done: Boolean) = launchCore {
+        core.setTaskDone(id, done)
+        _state.value.course?.occurrence?.id?.let { loadCourse(it) }
+        reload(_state.value.selectedDay)
+    }
+
+    private suspend fun loadCourse(occurrenceId: String) {
+        val homework = core.homeworkFor(occurrenceId)
+        val next = core.nextSession(occurrenceId)
+        val nextHomework = next?.let { core.homeworkFor(it.id) }.orEmpty()
+        _state.update { current ->
+            val sheet = current.course ?: return@update current
+            if (sheet.occurrence.id != occurrenceId) return@update current
+            current.copy(
+                course = sheet.copy(
+                    homework = homework,
+                    next = next,
+                    nextHomework = nextHomework,
+                    loaded = true,
+                ),
+            )
+        }
     }
 
     // ---------------------------------------------------------- choses à faire

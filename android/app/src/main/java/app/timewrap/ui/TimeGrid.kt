@@ -33,6 +33,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.timewrap.core.BlockStyle
 import app.timewrap.core.DayAgenda
 import app.timewrap.core.Occurrence
 import java.time.LocalDate
@@ -196,20 +197,25 @@ private fun OccurrenceBlock(
             .offset(x = laneWidth * placed.lane, y = top)
             .height(height)
             .padding(vertical = 1.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(accent.copy(alpha = if (faded) 0.10f else 0.20f))
+            .blockSurface(occurrence.style, accent, faded = faded, exam = occurrence.exam)
             .clickable { onClick(occurrence) }
             .padding(start = 8.dp, end = 6.dp, top = 3.dp, bottom = 3.dp),
     ) {
-        Box(
-            Modifier
-                .width(3.dp)
-                .fillMaxSize()
-                .clip(RoundedCornerShape(2.dp))
-                .background(if (faded) accent.copy(alpha = 0.4f) else accent),
-        )
+        // Le contour se suffit à lui-même ; les autres styles gardent leur
+        // trait de couleur à gauche.
+        if (occurrence.style != BlockStyle.OUTLINE) {
+            Box(
+                Modifier
+                    .width(3.dp)
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(if (faded) accent.copy(alpha = 0.4f) else accent),
+            )
+        }
         Column(Modifier.padding(start = 8.dp)) {
-            if (!compact && occurrence.categoryLabel.isNotBlank()) {
+            if (occurrence.exam) {
+                ExamBadge(accent)
+            } else if (!compact && occurrence.categoryLabel.isNotBlank()) {
                 CategoryChip(occurrence.categoryLabel, accent)
             }
             Text(
@@ -234,6 +240,31 @@ private fun OccurrenceBlock(
                 )
             }
         }
+        if (occurrence.homework > 0u) {
+            HomeworkBadge(
+                count = occurrence.homework.toInt(),
+                accent = accent,
+                modifier = Modifier.align(Alignment.TopEnd),
+            )
+        }
+    }
+}
+
+/** « 2 devoirs » réduit à une pastille dans le coin du bloc. */
+@Composable
+fun HomeworkBadge(count: Int, accent: Color, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(accent)
+            .padding(horizontal = 4.dp, vertical = 1.dp),
+    ) {
+        Text(
+            text = "✎$count",
+            color = Color.White,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+        )
     }
 }
 
