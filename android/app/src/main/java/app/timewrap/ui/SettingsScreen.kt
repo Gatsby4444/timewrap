@@ -72,6 +72,7 @@ fun SettingsScreen(
     onRename: (String) -> Unit,
     onColor: (UInt) -> Unit,
     onColors: () -> Unit,
+    onHistory: () -> Unit,
     onConflicts: () -> Unit,
     onClear: () -> Unit,
 ) {
@@ -186,17 +187,24 @@ fun SettingsScreen(
             }
         }
 
-        if (state.lastChanges.isNotEmpty()) {
+        if (state.hasTimetable) {
             item {
-                Card(Modifier.fillMaxWidth()) {
+                Card(onClick = onHistory, modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp)) {
-                        SectionLabel("Derniers changements")
-                        state.lastChanges.take(5).forEach { change ->
-                            Text(
-                                text = "· ${change.summary}",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
+                        Text(
+                            text = "Historique des changements",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = when (state.unseenChanges) {
+                                0 -> "Ce que chaque synchronisation a trouvé, avec l'avant et l'après."
+                                1 -> "1 changement pas encore vu."
+                                else -> "${state.unseenChanges} changements pas encore vus."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                        )
                     }
                 }
             }

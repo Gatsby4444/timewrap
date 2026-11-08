@@ -50,6 +50,7 @@ fun NowScreen(
     onImport: () -> Unit,
     onSelect: (Occurrence) -> Unit,
     onOpenTasks: () -> Unit = {},
+    onOpenHistory: () -> Unit = {},
 ) {
     if (!state.hasTimetable) {
         EmptyState(onImport)
@@ -65,10 +66,40 @@ fun NowScreen(
     ) {
         item {
             Text(
-                text = LocalDate.now(deviceZone).longLabel(),
+                text = LocalDate.ofEpochDay(state.today).longLabel(),
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
             )
+        }
+
+        // Une notification balayée sans être lue ne doit pas faire perdre un
+        // changement : tant qu'il n'a pas été vu, il s'annonce ici.
+        if (state.unseenChanges > 0) {
+            item {
+                Card(
+                    onClick = onOpenHistory,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                    ),
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text(
+                            text = if (state.unseenChanges == 1) {
+                                "Un changement dans l'emploi du temps"
+                            } else {
+                                "${state.unseenChanges} changements dans l'emploi du temps"
+                            },
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = "Voir ce qui a bougé, avant et après.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
         }
 
         item { TaskSummaryCard(state, onOpenTasks) }

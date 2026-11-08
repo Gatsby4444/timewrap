@@ -1155,6 +1155,154 @@ fn one_course(hour: u32, location: &str, cancelled: bool) -> String {
     )
 }
 
+/// Un cours hebdomadaire du jeudi, sous un seul UID, sur `weeks` semaines.
+fn weekly_course(hour: u32, weeks: u32) -> String {
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Timewrap//Test//FR\r\n\
+         BEGIN:VEVENT\r\nUID:SERIE-1@timewrap\r\n\
+         DTSTART;TZID=Europe/Paris:20261001T{hour:02}0000\r\n\
+         DTEND;TZID=Europe/Paris:20261001T{end:02}0000\r\n\
+         RRULE:FREQ=WEEKLY;COUNT={weeks}\r\n\
+         SUMMARY:Analyse\r\nLOCATION:C204\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n",
+        end = hour + 2
+    )
+}
+
+/// Comme [`one_course`], avec une heure de fin choisie.
+fn one_course_until(hour: u32, end: u32) -> String {
+    one_course(hour, "C204", false).replace(
+        &format!("DTEND;TZID=Europe/Paris:20261001T{:02}0000", hour + 2),
+        &format!("DTEND;TZID=Europe/Paris:20261001T{end:02}0000"),
+    )
+}
+
+fn resync(store: &Store, text: &str, at: i64) -> crate::model::SyncReport {
+    store
+        .import_ics(
+            "EDT",
+            CalendarKind::IcsUrl,
+            "https://ent/edt.ics",
+            text,
+            ImportMode::Keep,
+            at,
+        )
+        .unwrap()
+}
+
+#[test]
+fn une_serie_decalee_annonce_chaque_seance_a_sa_vraie_date() {
+    let store = store_with(&weekly_course(10, 4));
+    let rapport = resync(&store, &weekly_course(11, 4), now());
+
+    assert_eq!(rapport.changes.len(), 4, "{:?}", rapport.changes);
+    for change in &rapport.changes {
+        let avant = change.before.as_ref().unwrap();
+        let apres = change.after.as_ref().unwrap();
+        assert_eq!(
+            apres.start_utc - avant.start_utc,
+            3600,
+            "chaque séance glisse d'une heure le même jour : {}",
+            change.summary
+        );
+    }
+    assert!(
+        rapport.changes[1]
+            .summary
+            .contains("jeudi 8 octobre, 10:00 – 12:00")
+    );
+    assert!(
+        rapport.changes[1]
+            .summary
+            .contains("jeudi 8 octobre, 11:00 – 13:00")
+    );
+}
+
+#[test]
+fn une_heure_de_fin_changee_est_annoncee() {
+    let store = store_with(&one_course(10, "C204", false));
+    let rapport = resync(&store, &one_course_until(10, 11), now());
+
+    assert_eq!(rapport.changes.len(), 1, "{:?}", rapport.changes);
+    let change = &rapport.changes[0];
+    assert_eq!(change.kind, crate::model::ChangeKind::Moved);
+    assert!(
+        change.summary.contains("finit à 11:00 au lieu de 12:00"),
+        "{}",
+        change.summary
+    );
+}
+
+#[test]
+fn une_seance_retablie_est_annoncee() {
+    let store = store_with(&one_course(10, "C204", true));
+    let rapport = resync(&store, &one_course(10, "C204", false), now());
+
+    assert_eq!(rapport.changes.len(), 1, "{:?}", rapport.changes);
+    assert_eq!(rapport.changes[0].kind, crate::model::ChangeKind::Restored);
+    assert!(rapport.changes[0].summary.contains("rétabli"));
+}
+
+#[test]
+fn lhistorique_garde_lavant_et_lapres_de_chaque_synchronisation() {
+    let store = store_with(&one_course(10, "C204", false));
+    let premiere = now();
+    let seconde = now() + 3600;
+    resync(&store, &one_course(10, "D101", false), premiere);
+    resync(&store, &one_course(14, "D101", false), seconde);
+
+    let historique = store.change_history(100).unwrap();
+    assert_eq!(historique.len(), 2);
+    assert_eq!(store.unseen_change_count().unwrap(), 2);
+
+    // Le plus récent d'abord.
+    let deplacement = &historique[0];
+    assert_eq!(deplacement.detected_utc, seconde);
+    assert_eq!(deplacement.change.kind, crate::model::ChangeKind::Moved);
+    let avant = deplacement.change.before.as_ref().unwrap();
+    let apres = deplacement.change.after.as_ref().unwrap();
+    assert_eq!(avant.start_utc, paris(2026, 10, 1, 10, 0));
+    assert_eq!(apres.start_utc, paris(2026, 10, 1, 14, 0));
+    assert_eq!(apres.end_utc, paris(2026, 10, 1, 16, 0));
+
+    let salle = &historique[1];
+    assert_eq!(salle.detected_utc, premiere);
+    assert_eq!(salle.change.before.as_ref().unwrap().location, "C204");
+    assert_eq!(salle.change.after.as_ref().unwrap().location, "D101");
+
+    store.mark_changes_seen().unwrap();
+    assert_eq!(store.unseen_change_count().unwrap(), 0);
+    assert!(store.change_history(100).unwrap().iter().all(|e| e.seen));
+}
+
+#[test]
+fn un_retrait_na_pas_dapres_et_un_ajout_pas_davant() {
+    let store = store_with(&one_course(10, "C204", false));
+    let vide =
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Timewrap//Test//FR\r\nEND:VCALENDAR\r\n";
+    resync(&store, vide, now());
+    resync(&store, &one_course(10, "C204", false), now() + 60);
+
+    let historique = store.change_history(100).unwrap();
+    assert_eq!(historique.len(), 2);
+    let ajout = &historique[0].change;
+    let retrait = &historique[1].change;
+    assert_eq!(ajout.kind, crate::model::ChangeKind::Added);
+    assert!(ajout.before.is_none() && ajout.after.is_some());
+    assert_eq!(retrait.kind, crate::model::ChangeKind::Removed);
+    assert!(retrait.before.is_some() && retrait.after.is_none());
+}
+
+#[test]
+fn effacer_lemploi_du_temps_vide_lhistorique() {
+    let store = store_with(&one_course(10, "C204", false));
+    resync(&store, &one_course(10, "D101", false), now());
+    assert_eq!(store.change_history(100).unwrap().len(), 1);
+
+    store.clear_timetable().unwrap();
+    assert!(store.change_history(100).unwrap().is_empty());
+}
+
 fn store_with(text: &str) -> Store {
     let store = store_vide();
     store
@@ -1185,9 +1333,28 @@ fn un_premier_import_nannonce_pas_de_changement() {
         .unwrap();
     assert_eq!(rapport.import.occurrences, 1);
     assert!(
-        rapport.changes.iter().all(|c| c.summary.contains("ajouté")),
-        "tout est nouveau, mais rien n'a bougé"
+        rapport.changes.is_empty(),
+        "tout est nouveau, mais rien n'a bougé : {:?}",
+        rapport.changes
     );
+    assert!(store.change_history(100).unwrap().is_empty());
+}
+
+#[test]
+fn repartir_de_zero_nannonce_pas_de_changement() {
+    let store = store_with(&one_course(10, "C204", false));
+    let rapport = store
+        .import_ics(
+            "EDT",
+            CalendarKind::IcsUrl,
+            "https://ent/edt.ics",
+            &one_course(14, "D101", false),
+            ImportMode::Fresh,
+            now(),
+        )
+        .unwrap();
+    assert!(rapport.changes.is_empty(), "{:?}", rapport.changes);
+    assert!(store.change_history(100).unwrap().is_empty());
 }
 
 #[test]

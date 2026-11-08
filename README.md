@@ -135,6 +135,12 @@ l'avant et l'après **en appariant les séances par UID** : une séance qui gard
 déplacée, pas supprimée puis recréée. C'est la différence entre « ton TD d'Analyse passe du mardi
 13:30 au mardi 15:00 » et deux notifications illisibles.
 
+Chaque changement est aussi **consigné dans un historique** (quatre mois), avec l'avant et
+l'après : une notification se balaie ou se tronque, l'historique reste. Les notifications
+elles-mêmes arrivent une par changement, regroupées sous un résumé, chacune avec sa phrase
+entière ; les toucher ouvre l'historique. Un premier import, ou un import qui repart de zéro,
+n'annonce rien : il n'y a rien à quoi le comparer.
+
 Trois canaux de notification distincts, parce que trois urgences distinctes : les changements, les
 rappels avant les cours (délai réglable), le résumé du matin. Les séparer laisse couper l'un sans
 perdre l'autre, ce que le réglage système fait très bien à notre place. Les alarmes sont exactes
@@ -229,6 +235,7 @@ retélécharger l'adresse d'abonnement fournie par l'utilisateur ; rien d'autre 
 | **4** ✅ | Événements saisis sur place, moteur de chevauchements, liste de choses à faire reportable |
 | **4.1** ✅ | Import qui annonce ce qu'il remplace, choix « repartir de zéro », source exclusive |
 | **4.2** ✅ | Racines GÉANT/HARICA embarquées, échecs réseau traduits en français |
+| **4.3** ✅ | Historique des changements avec l'avant et l'après, notifications dépliables une par changement, navigation Jour / Semaine fiabilisée |
 | **5** | Devoirs et notes rattachés à un cours, widget, finitions, puis portage iOS sur le même cœur |
 
 ## Licence

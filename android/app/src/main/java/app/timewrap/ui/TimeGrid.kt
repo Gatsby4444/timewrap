@@ -55,6 +55,8 @@ private const val DEFAULT_LAST_HOUR = 19
 @Composable
 fun TimeGrid(
     days: List<DayAgenda>,
+    /** Le jour courant, tel que le modèle le tient : c'est lui qu'on souligne. */
+    today: Long,
     modifier: Modifier = Modifier,
     hourHeight: Dp = 64.dp,
     dayHeader: (@Composable (LocalDate, Boolean) -> Unit)? = null,
@@ -68,7 +70,6 @@ fun TimeGrid(
     val hours = lastHour - firstHour
 
     val scroll = rememberScrollState()
-    val today = todayEpochDay()
 
     // On amène d'emblée le regard sur le début de la journée réelle plutôt que
     // sur une zone vide.

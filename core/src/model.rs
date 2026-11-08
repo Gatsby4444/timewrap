@@ -367,20 +367,74 @@ pub struct ImportReport {
 pub enum ChangeKind {
     Added,
     Removed,
+    /// L'horaire a bougé : début, fin, ou les deux.
     Moved,
     Cancelled,
+    /// Une séance annulée qui revient.
+    Restored,
     Room,
 }
 
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Added => "added",
+            ChangeKind::Removed => "removed",
+            ChangeKind::Moved => "moved",
+            ChangeKind::Cancelled => "cancelled",
+            ChangeKind::Restored => "restored",
+            ChangeKind::Room => "room",
+        }
+    }
+
+    pub fn parse(value: &str) -> ChangeKind {
+        match value {
+            "added" => ChangeKind::Added,
+            "removed" => ChangeKind::Removed,
+            "cancelled" => ChangeKind::Cancelled,
+            "restored" => ChangeKind::Restored,
+            "room" => ChangeKind::Room,
+            _ => ChangeKind::Moved,
+        }
+    }
+}
+
+/// Une séance telle qu'elle était, ou telle qu'elle est devenue.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ChangeSlot {
+    pub start_utc: i64,
+    pub end_utc: i64,
+    pub location: String,
+}
+
 /// Un changement, déjà rédigé pour être affiché tel quel.
+///
+/// La phrase suffit à une notification ; `before` et `after` permettent à
+/// l'historique de montrer l'avant et l'après côte à côte, sans rien deviner.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Change {
     pub kind: ChangeKind,
     pub title: String,
-    /// Phrase prête à lire : « Le TD d'Analyse de mardi passe de 13:30 à 15:00 ».
+    /// Phrase prête à lire : « « Analyse » passe du mardi 22 septembre à 13:30 au … ».
     pub summary: String,
     /// Quand se tient la séance concernée, après changement.
     pub start_utc: i64,
+    /// La séance avant le changement ; absente pour un ajout.
+    pub before: Option<ChangeSlot>,
+    /// La séance après le changement ; absente pour un retrait.
+    pub after: Option<ChangeSlot>,
+}
+
+/// Un changement retenu dans l'historique.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChangeEntry {
+    pub id: i64,
+    /// Quand la synchronisation l'a constaté, en secondes Unix. Tous les
+    /// changements d'une même synchronisation partagent cet instant.
+    pub detected_utc: i64,
+    /// Vrai une fois l'historique ouvert depuis.
+    pub seen: bool,
+    pub change: Change,
 }
 
 /// Bilan d'une synchronisation : ce qui a été lu, et ce qui a bougé.

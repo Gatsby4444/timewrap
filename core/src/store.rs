@@ -18,10 +18,10 @@ use crate::conflict;
 use crate::error::{Result, TimewrapError};
 use crate::ics;
 use crate::model::{
-    CalendarKind, Category, Change, ChangeKind, Conflict, ConflictPair, DayAgenda, EventDraft,
-    EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey, PropertyValue,
-    Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion, SaveOutcome,
-    Settings, SyncReport, Task, Timetable,
+    CalendarKind, Category, Change, ChangeEntry, ChangeKind, ChangeSlot, Conflict, ConflictPair,
+    DayAgenda, EventDraft, EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey,
+    PropertyValue, Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion,
+    SaveOutcome, Settings, SyncReport, Task, Timetable,
 };
 use crate::properties::{self, Property};
 use crate::rules;
@@ -40,6 +40,10 @@ const DIFF_HORIZON: Duration = Duration::days(45);
 const MAX_SHIFT_STEPS: u8 = 8;
 /// Au-delà, une liste de changements n'est plus lisible dans une notification.
 const MAX_CHANGES: usize = 40;
+/// Combien de temps l'historique garde un changement.
+const CHANGE_LOG_RETENTION: Duration = Duration::days(120);
+/// Au-delà, les plus anciens changements laissent la place.
+const CHANGE_LOG_MAX: i64 = 1000;
 
 /// Couleurs attribuées aux catégories dans l'ordre de création.
 pub const PALETTE: [u32; 8] = [
@@ -229,6 +233,34 @@ impl Store {
             self.conn.execute_batch("PRAGMA user_version = 3;")?;
         }
 
+        // v4 : l'historique des changements.
+        //
+        // Une notification se perd, se balaie, se tronque. Ce qu'une
+        // synchronisation a constaté doit pouvoir se relire dans l'application,
+        // avec l'avant et l'après, aussi longtemps que cela peut servir.
+        if version < 4 {
+            self.conn.execute_batch(
+                "CREATE TABLE change_log (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     detected_utc    INTEGER NOT NULL,
+                     kind            TEXT NOT NULL,
+                     title           TEXT NOT NULL,
+                     summary         TEXT NOT NULL,
+                     start_utc       INTEGER NOT NULL,
+                     before_start    INTEGER,
+                     before_end      INTEGER,
+                     before_location TEXT,
+                     after_start     INTEGER,
+                     after_end       INTEGER,
+                     after_location  TEXT,
+                     seen            INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX idx_change_log_detected ON change_log(detected_utc);
+
+                 PRAGMA user_version = 4;",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -345,6 +377,10 @@ impl Store {
         mode: ImportMode,
         now_utc: i64,
     ) -> Result<SyncReport> {
+        // Un premier import, ou un import qui repart de zéro, n'a rien à quoi se
+        // comparer : tout y serait « ajouté », ce qui n'apprend rien. Seul un
+        // remplacement du contenu existant produit des changements.
+        let compare = mode == ImportMode::Keep && self.timetable()?.is_some();
         if mode == ImportMode::Fresh {
             self.wipe()?;
         }
@@ -395,10 +431,16 @@ impl Store {
         let import = self.rebuild(&id, ics_text, now_utc)?;
         let after = self.diff_snapshot(now_utc)?;
 
-        Ok(SyncReport {
-            import,
-            changes: self.describe_changes(&before, &after),
-        })
+        let mut changes = if compare {
+            self.describe_changes(&before, &after)
+        } else {
+            Vec::new()
+        };
+        // L'historique garde tout ; la notification, elle, a ses limites.
+        self.log_changes(&changes, now_utc)?;
+        changes.truncate(MAX_CHANGES);
+
+        Ok(SyncReport { import, changes })
     }
 
     pub fn set_color(&self, color: u32) -> Result<()> {
@@ -420,6 +462,7 @@ impl Store {
     /// ferait réapparaître ce que l'on vient d'effacer.
     pub fn clear_timetable(&self) -> Result<()> {
         self.conn.execute("DELETE FROM calendars", [])?;
+        self.conn.execute("DELETE FROM change_log", [])?;
         self.set_setting("source_url", "")?;
         self.set_setting("sync_enabled", "0")?;
         Ok(())
@@ -435,6 +478,8 @@ impl Store {
             self.conn.execute("DELETE FROM calendars", [])?;
             self.conn.execute("DELETE FROM rules", [])?;
             self.conn.execute("DELETE FROM categories", [])?;
+            // L'historique raconte un emploi du temps qui n'existe plus.
+            self.conn.execute("DELETE FROM change_log", [])?;
             Ok(())
         })
     }
@@ -644,7 +689,7 @@ impl Store {
     fn diff_snapshot(&self, now_utc: i64) -> Result<Vec<Snapshot>> {
         let to = now_utc + DIFF_HORIZON.num_seconds();
         let mut stmt = self.conn.prepare(
-            "SELECT uid, summary, location, start_utc, cancelled
+            "SELECT uid, summary, location, start_utc, end_utc, cancelled
              FROM occurrences
              WHERE origin = 'ics' AND start_utc >= ?1 AND start_utc < ?2
              ORDER BY start_utc",
@@ -655,7 +700,8 @@ impl Store {
                 title: row.get(1)?,
                 location: row.get(2)?,
                 start_utc: row.get(3)?,
-                cancelled: row.get::<_, i64>(4)? != 0,
+                end_utc: row.get(4)?,
+                cancelled: row.get::<_, i64>(5)? != 0,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -666,74 +712,244 @@ impl Store {
     /// L'appariement se fait par UID : une séance qui garde le sien a été
     /// déplacée, pas supprimée puis recréée. C'est la différence entre « ton TD
     /// de mardi passe à 15h » et deux notifications illisibles.
+    ///
+    /// Une série entière partage souvent un seul UID. Chaque nouvelle séance ne
+    /// sert donc qu'une fois, et une ancienne retrouve la plus proche dans le
+    /// temps : décaler toute une série d'une heure donne une phrase juste par
+    /// séance, au lieu d'envoyer toutes les anciennes vers la première nouvelle.
     fn describe_changes(&self, before: &[Snapshot], after: &[Snapshot]) -> Vec<Change> {
         let mut changes = Vec::new();
+        let mut used = vec![false; after.len()];
 
+        // Premier passage : même série, même début — la même séance.
+        let mut pending = Vec::new();
         for old in before {
-            match after.iter().find(|n| n.same_slot(old)) {
-                Some(new) => {
-                    if new.cancelled && !old.cancelled {
-                        let summary = format!(
-                            "« {} » du {} est annulé",
-                            new.title,
-                            self.day_label(new.start_utc)
-                        );
-                        changes.push(change(ChangeKind::Cancelled, new, summary));
-                    } else if new.location != old.location && !new.location.is_empty() {
-                        let summary = format!(
-                            "« {} » du {} change de salle : {} → {}",
-                            new.title,
-                            self.day_label(new.start_utc),
-                            if old.location.is_empty() {
-                                "sans salle"
-                            } else {
-                                &old.location
-                            },
-                            new.location
-                        );
-                        changes.push(change(ChangeKind::Room, new, summary));
+            match after
+                .iter()
+                .enumerate()
+                .find(|(i, n)| !used[*i] && n.same_slot(old))
+            {
+                Some((i, new)) => {
+                    used[i] = true;
+                    if let Some(change) = self.compare_same_slot(old, new) {
+                        changes.push(change);
                     }
                 }
-                None => match after
-                    .iter()
-                    .find(|n| n.uid == old.uid && !n.matched(before))
-                {
-                    Some(moved) => {
-                        let summary = format!(
-                            "« {} » passe du {} au {}",
-                            moved.title,
-                            self.slot_label(old.start_utc),
-                            self.slot_label(moved.start_utc)
-                        );
-                        changes.push(change(ChangeKind::Moved, moved, summary));
-                    }
-                    None => {
-                        let summary = format!(
-                            "« {} » du {} est retiré de l'emploi du temps",
-                            old.title,
-                            self.slot_label(old.start_utc)
-                        );
-                        changes.push(change(ChangeKind::Removed, old, summary));
-                    }
-                },
+                None => pending.push(old),
             }
         }
 
-        for new in after {
-            let known = before.iter().any(|o| o.same_slot(new) || o.uid == new.uid);
-            if !known {
-                let summary = format!(
-                    "« {} » ajouté le {}",
-                    new.title,
-                    self.slot_label(new.start_utc)
-                );
-                changes.push(change(ChangeKind::Added, new, summary));
+        // Second passage : même série, début différent — une séance déplacée.
+        for old in pending {
+            let moved = after
+                .iter()
+                .enumerate()
+                .filter(|(i, n)| !used[*i] && n.uid == old.uid)
+                .min_by_key(|(_, n)| (n.start_utc - old.start_utc).abs());
+            match moved {
+                Some((i, new)) => {
+                    used[i] = true;
+                    let mut summary = format!(
+                        "« {} » passe du {} au {}",
+                        new.title,
+                        self.slot_range_label(old.start_utc, old.end_utc),
+                        self.slot_range_label(new.start_utc, new.end_utc)
+                    );
+                    if new.location != old.location && !new.location.is_empty() {
+                        summary.push_str(&format!(", en {}", new.location));
+                    }
+                    changes.push(change(
+                        ChangeKind::Moved,
+                        new,
+                        summary,
+                        Some(old),
+                        Some(new),
+                    ));
+                }
+                None => {
+                    let summary = format!(
+                        "« {} » du {} est retiré de l'emploi du temps",
+                        old.title,
+                        self.slot_range_label(old.start_utc, old.end_utc)
+                    );
+                    changes.push(change(ChangeKind::Removed, old, summary, Some(old), None));
+                }
             }
+        }
+
+        for (i, new) in after.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            let mut summary = format!(
+                "« {} » ajouté le {}",
+                new.title,
+                self.slot_range_label(new.start_utc, new.end_utc)
+            );
+            if !new.location.is_empty() {
+                summary.push_str(&format!(", en {}", new.location));
+            }
+            changes.push(change(ChangeKind::Added, new, summary, None, Some(new)));
         }
 
         changes.sort_by_key(|c| c.start_utc);
-        changes.truncate(MAX_CHANGES);
         changes
+    }
+
+    /// La même séance, avant et après : annulée, rétablie, salle, heure de fin.
+    fn compare_same_slot(&self, old: &Snapshot, new: &Snapshot) -> Option<Change> {
+        if new.cancelled && !old.cancelled {
+            let summary = format!(
+                "« {} » du {} est annulé",
+                new.title,
+                self.slot_range_label(new.start_utc, new.end_utc)
+            );
+            return Some(change(
+                ChangeKind::Cancelled,
+                new,
+                summary,
+                Some(old),
+                Some(new),
+            ));
+        }
+        if old.cancelled && !new.cancelled {
+            let summary = format!(
+                "« {} » du {} est rétabli",
+                new.title,
+                self.slot_range_label(new.start_utc, new.end_utc)
+            );
+            return Some(change(
+                ChangeKind::Restored,
+                new,
+                summary,
+                Some(old),
+                Some(new),
+            ));
+        }
+
+        // Une salle qui disparaît est presque toujours un trou passager de
+        // l'export : l'annoncer réveillerait pour rien.
+        let room = new.location != old.location && !new.location.is_empty();
+        let end = new.end_utc != old.end_utc;
+        let old_room = if old.location.is_empty() {
+            "sans salle"
+        } else {
+            old.location.as_str()
+        };
+        let day = self.day_label(new.start_utc);
+        let summary = match (room, end) {
+            (false, false) => return None,
+            (true, false) => format!(
+                "« {} » du {} change de salle : {} → {}",
+                new.title, day, old_room, new.location
+            ),
+            (false, true) => format!(
+                "« {} » du {} finit à {} au lieu de {}",
+                new.title,
+                day,
+                self.time_label(new.end_utc),
+                self.time_label(old.end_utc)
+            ),
+            (true, true) => format!(
+                "« {} » du {} finit à {} au lieu de {}, et change de salle : {} → {}",
+                new.title,
+                day,
+                self.time_label(new.end_utc),
+                self.time_label(old.end_utc),
+                old_room,
+                new.location
+            ),
+        };
+        let kind = if end {
+            ChangeKind::Moved
+        } else {
+            ChangeKind::Room
+        };
+        Some(change(kind, new, summary, Some(old), Some(new)))
+    }
+
+    // ---------------------------------------------- historique des changements
+
+    /// Consigne ce qu'une synchronisation a constaté, et oublie le trop ancien.
+    fn log_changes(&self, changes: &[Change], now_utc: i64) -> Result<()> {
+        self.transact(|| {
+            {
+                let mut stmt = self.conn.prepare(
+                    "INSERT INTO change_log
+                     (detected_utc, kind, title, summary, start_utc,
+                      before_start, before_end, before_location,
+                      after_start, after_end, after_location)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )?;
+                for change in changes {
+                    let before = change.before.as_ref();
+                    let after = change.after.as_ref();
+                    stmt.execute(params![
+                        now_utc,
+                        change.kind.as_str(),
+                        change.title,
+                        change.summary,
+                        change.start_utc,
+                        before.map(|s| s.start_utc),
+                        before.map(|s| s.end_utc),
+                        before.map(|s| s.location.as_str()),
+                        after.map(|s| s.start_utc),
+                        after.map(|s| s.end_utc),
+                        after.map(|s| s.location.as_str()),
+                    ])?;
+                }
+            }
+            self.conn.execute(
+                "DELETE FROM change_log WHERE detected_utc < ?1",
+                params![now_utc - CHANGE_LOG_RETENTION.num_seconds()],
+            )?;
+            self.conn.execute(
+                "DELETE FROM change_log WHERE id NOT IN
+                 (SELECT id FROM change_log ORDER BY detected_utc DESC, id DESC LIMIT ?1)",
+                params![CHANGE_LOG_MAX],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// L'historique, du plus récent au plus ancien ; dans une même
+    /// synchronisation, dans l'ordre des séances.
+    pub fn change_history(&self, limit: u32) -> Result<Vec<ChangeEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, detected_utc, seen, kind, title, summary, start_utc,
+                    before_start, before_end, before_location,
+                    after_start, after_end, after_location
+             FROM change_log
+             ORDER BY detected_utc DESC, start_utc, id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ChangeEntry {
+                id: row.get(0)?,
+                detected_utc: row.get(1)?,
+                seen: row.get::<_, i64>(2)? != 0,
+                change: Change {
+                    kind: ChangeKind::parse(&row.get::<_, String>(3)?),
+                    title: row.get(4)?,
+                    summary: row.get(5)?,
+                    start_utc: row.get(6)?,
+                    before: logged_slot(row.get(7)?, row.get(8)?, row.get(9)?),
+                    after: logged_slot(row.get(10)?, row.get(11)?, row.get(12)?),
+                },
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Combien de changements n'ont pas encore été vus dans l'historique.
+    pub fn unseen_change_count(&self) -> Result<u32> {
+        self.count("SELECT COUNT(*) FROM change_log WHERE seen = 0")
+    }
+
+    pub fn mark_changes_seen(&self) -> Result<()> {
+        self.conn
+            .execute("UPDATE change_log SET seen = 1 WHERE seen = 0", [])?;
+        Ok(())
     }
 
     /// « mardi 22 septembre »
@@ -750,17 +966,22 @@ impl Store {
         )
     }
 
-    /// « mardi 22 septembre à 13:30 »
-    fn slot_label(&self, utc: i64) -> String {
+    /// « 13:30 »
+    fn time_label(&self, utc: i64) -> String {
         let Some(dt) = DateTime::from_timestamp(utc, 0) else {
             return String::new();
         };
         let local = dt.with_timezone(&self.tz);
+        format!("{:02}:{:02}", local.hour(), local.minute())
+    }
+
+    /// « mardi 22 septembre, 13:30 – 15:00 »
+    fn slot_range_label(&self, start_utc: i64, end_utc: i64) -> String {
         format!(
-            "{} à {:02}:{:02}",
-            self.day_label(utc),
-            local.hour(),
-            local.minute()
+            "{}, {} – {}",
+            self.day_label(start_utc),
+            self.time_label(start_utc),
+            self.time_label(end_utc)
         )
     }
 
@@ -1982,6 +2203,7 @@ struct Snapshot {
     title: String,
     location: String,
     start_utc: i64,
+    end_utc: i64,
     cancelled: bool,
 }
 
@@ -1991,9 +2213,12 @@ impl Snapshot {
         self.uid == other.uid && self.start_utc == other.start_utc
     }
 
-    /// Vrai si cette séance retrouve son exact équivalent dans une liste.
-    fn matched(&self, others: &[Snapshot]) -> bool {
-        others.iter().any(|o| o.same_slot(self))
+    fn slot(&self) -> ChangeSlot {
+        ChangeSlot {
+            start_utc: self.start_utc,
+            end_utc: self.end_utc,
+            location: self.location.clone(),
+        }
     }
 }
 
@@ -2016,12 +2241,20 @@ fn kept_phrase(local_events: u32, customisations: u32, muted: u32) -> String {
     }
 }
 
-fn change(kind: ChangeKind, snapshot: &Snapshot, summary: String) -> Change {
+fn change(
+    kind: ChangeKind,
+    snapshot: &Snapshot,
+    summary: String,
+    before: Option<&Snapshot>,
+    after: Option<&Snapshot>,
+) -> Change {
     Change {
         kind,
         title: snapshot.title.clone(),
         summary,
         start_utc: snapshot.start_utc,
+        before: before.map(Snapshot::slot),
+        after: after.map(Snapshot::slot),
     }
 }
 
@@ -2177,4 +2410,18 @@ fn month_name(month: u32) -> &'static str {
 fn parse_tz(name: &str) -> Result<Tz> {
     name.parse()
         .map_err(|_| TimewrapError::UnknownTimezone(name.to_string()))
+}
+
+/// Relit une séance de l'historique ; un ajout n'a pas d'avant, un retrait pas
+/// d'après.
+fn logged_slot(
+    start: Option<i64>,
+    end: Option<i64>,
+    location: Option<String>,
+) -> Option<ChangeSlot> {
+    Some(ChangeSlot {
+        start_utc: start?,
+        end_utc: end?,
+        location: location.unwrap_or_default(),
+    })
 }

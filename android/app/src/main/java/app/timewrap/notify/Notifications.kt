@@ -29,8 +29,17 @@ object Notifications {
     const val CHANNEL_REMINDERS = "rappels"
     const val CHANNEL_DIGEST = "resume"
 
+    /** Ce qu'une notification demande d'ouvrir, passé à l'activité. */
+    const val EXTRA_OPEN = "app.timewrap.open"
+    const val OPEN_HISTORY = "history"
+
     private const val ID_CHANGES = 1
     private const val ID_DIGEST = 2
+    private const val GROUP_CHANGES = "app.timewrap.changes"
+    /** Au-delà, une notification par changement deviendrait du bruit. */
+    private const val MAX_CHANGE_NOTIFICATIONS = 8
+    /** Les changements d'une synchronisation : de cette base à base + max. */
+    private const val ID_CHANGE_BASE = 100
     /** Les rappels s'empilent : chacun le sien, à partir de cette base. */
     private const val ID_REMINDER_BASE = 1000
 
@@ -78,26 +87,64 @@ object Notifications {
     /**
      * Annonce ce qui a bougé après une synchronisation.
      *
+     * Une notification par changement, regroupées sous un résumé : chacune
+     * garde sa phrase entière, dépliable. Avant, tout tenait dans une seule
+     * notification à lignes, et le système coupait chaque ligne au bord de
+     * l'écran — on savait qu'un cours avait bougé, pas où ni quand.
+     *
+     * Toutes ouvrent l'historique, qui garde l'avant et l'après de chaque
+     * changement après que la notification a été balayée.
+     *
      * Le texte vient du cœur, déjà rédigé : l'interface n'a pas à savoir
      * conjuguer « est annulé » ni à formater une date.
      */
     fun changes(context: Context, changes: List<Change>) {
         if (changes.isEmpty()) return
+        val manager = NotificationManagerCompat.from(context)
+        // Les notifications de la synchronisation précédente racontent un état
+        // dépassé : on les remplace plutôt que d'empiler.
+        (0..MAX_CHANGE_NOTIFICATIONS).forEach { manager.cancel(ID_CHANGE_BASE + it) }
+
         val title = when (changes.size) {
             1 -> "Un changement dans votre emploi du temps"
             else -> "${changes.size} changements dans votre emploi du temps"
         }
-        val style = NotificationCompat.InboxStyle()
-        changes.take(6).forEach { style.addLine(it.summary) }
-        if (changes.size > 6) style.setSummaryText("et ${changes.size - 6} de plus")
+        val shown = changes.take(MAX_CHANGE_NOTIFICATIONS)
+        val rest = changes.size - shown.size
 
+        shown.forEachIndexed { index, change ->
+            post(
+                context,
+                ID_CHANGE_BASE + index,
+                builder(context, CHANNEL_CHANGES, openHistory = true)
+                    .setContentTitle(change.title)
+                    .setContentText(change.summary)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(change.summary))
+                    .setGroup(GROUP_CHANGES)
+                    .setWhen(System.currentTimeMillis())
+                    // Une seule sonnerie pour toute la synchronisation : c'est le
+                    // résumé qui alerte.
+                    .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+                    .setSortKey("%03d".format(index))
+                    .build(),
+            )
+        }
+
+        val inbox = NotificationCompat.InboxStyle().setBigContentTitle(title)
+        shown.forEach { inbox.addLine(it.summary) }
+        inbox.setSummaryText(
+            if (rest > 0) "et $rest de plus — tout est dans l'historique" else "Ouvrir l'historique",
+        )
         post(
             context,
             ID_CHANGES,
-            builder(context, CHANNEL_CHANGES)
+            builder(context, CHANNEL_CHANGES, openHistory = true)
                 .setContentTitle(title)
                 .setContentText(changes.first().summary)
-                .setStyle(style)
+                .setStyle(inbox)
+                .setGroup(GROUP_CHANGES)
+                .setGroupSummary(true)
+                .setNumber(changes.size)
                 .build(),
         )
     }
@@ -126,19 +173,22 @@ object Notifications {
         )
     }
 
-    private fun builder(context: Context, channel: String) =
+    private fun builder(context: Context, channel: String, openHistory: Boolean = false) =
         NotificationCompat.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentIntent(openApp(context))
+            .setContentIntent(openApp(context, openHistory))
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_EVENT)
 
-    private fun openApp(context: Context): PendingIntent {
+    private fun openApp(context: Context, openHistory: Boolean): PendingIntent {
         val intent = Intent(context, MainActivity::class.java)
             .setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        if (openHistory) intent.putExtra(EXTRA_OPEN, OPEN_HISTORY)
         return PendingIntent.getActivity(
             context,
-            0,
+            // Deux intentions qui ne diffèrent que par un extra sont la même pour
+            // le système : un code distinct garde l'extra.
+            if (openHistory) 1 else 0,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )

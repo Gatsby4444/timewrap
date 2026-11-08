@@ -26,10 +26,10 @@ mod tests;
 
 pub use error::TimewrapError;
 pub use model::{
-    CalendarKind, Category, Change, ChangeKind, Conflict, ConflictPair, DayAgenda, EventDraft,
-    EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey, PropertyValue,
-    Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion, SaveOutcome,
-    Settings, SyncReport, Task, Timetable,
+    CalendarKind, Category, Change, ChangeEntry, ChangeKind, ChangeSlot, Conflict, ConflictPair,
+    DayAgenda, EventDraft, EventOrigin, ImportMode, ImportReport, NowView, Occurrence, PropertyKey,
+    PropertyValue, Reminder, ReplacePlan, Resolution, Rule, RuleField, RuleMatch, RuleSuggestion,
+    SaveOutcome, Settings, SyncReport, Task, Timetable,
 };
 
 use std::sync::{Arc, Mutex};
@@ -109,6 +109,22 @@ impl Timewrap {
     ) -> Result<SyncReport> {
         self.store()?
             .import_ics(&name, kind, &source, &ics_text, mode, now())
+    }
+
+    /// L'historique des changements constatés par les synchronisations, du
+    /// plus récent au plus ancien.
+    pub fn change_history(&self, limit: u32) -> Result<Vec<ChangeEntry>> {
+        self.store()?.change_history(limit)
+    }
+
+    /// Combien de changements n'ont pas encore été vus dans l'historique.
+    pub fn unseen_change_count(&self) -> Result<u32> {
+        self.store()?.unseen_change_count()
+    }
+
+    /// L'historique a été ouvert : tout ce qu'il montrait est vu.
+    pub fn mark_changes_seen(&self) -> Result<()> {
+        self.store()?.mark_changes_seen()
     }
 
     pub fn rename_timetable(&self, name: String) -> Result<()> {

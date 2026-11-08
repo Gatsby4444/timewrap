@@ -6,7 +6,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import app.timewrap.core.CalendarKind
 import app.timewrap.core.Category
-import app.timewrap.core.Change
+import app.timewrap.core.ChangeEntry
 import app.timewrap.core.Conflict
 import app.timewrap.core.ConflictPair
 import app.timewrap.core.DayAgenda
@@ -44,6 +44,9 @@ private const val PRELOAD_RADIUS = 21L
 
 /** Profondeur du gestionnaire de conflits, en jours. */
 private const val CONFLICT_HORIZON = 60L
+
+/** Ce que l'écran d'historique montre au plus. */
+private const val HISTORY_LIMIT = 300u
 
 /** Nom donné à un emploi du temps dont on ne sait rien d'autre. */
 private const val DEFAULT_NAME = "Emploi du temps"
@@ -92,8 +95,10 @@ data class UiState(
     val propertyValues: List<PropertyValue> = emptyList(),
     val conflicts: List<ConflictPair> = emptyList(),
     val muted: List<Occurrence> = emptyList(),
-    /// Ce qu'a annoncé la dernière synchronisation lancée à la main.
-    val lastChanges: List<Change> = emptyList(),
+    /// L'historique des changements, chargé à l'ouverture de son écran.
+    val history: List<ChangeEntry> = emptyList(),
+    /// Changements constatés depuis la dernière ouverture de l'historique.
+    val unseenChanges: Int = 0,
     val busy: Boolean = false,
     /// Message éphémère : bilan d'import ou erreur.
     val message: String? = null,
@@ -129,10 +134,6 @@ class AppViewModel(
     private val _draftConflicts = MutableStateFlow<List<Conflict>>(emptyList())
     val draftConflicts: StateFlow<List<Conflict>> = _draftConflicts.asStateFlow()
 
-    /** Bornes déjà en cache, pour ne recharger que ce qui manque. */
-    private var loadedFrom: Long = Long.MAX_VALUE
-    private var loadedTo: Long = Long.MIN_VALUE
-
     init {
         refresh()
         // WorkManager oublie ce qu'on ne lui redemande pas, et un nettoyage
@@ -142,12 +143,45 @@ class AppViewModel(
     }
 
     /** Recharge ce qui est affiché. */
-    fun refresh() = launchCore {
-        val snapshot = _state.value
-        loadShell()
-        invalidateDays()
-        loadAround(snapshot.selectedDay)
-        loadAround(snapshot.weekStart + 3)
+    fun refresh() = launchCore { reload(_state.value.selectedDay) }
+
+    /**
+     * Le battement de l'écran ouvert : l'heure avance, le jour peut changer,
+     * une synchronisation de fond peut avoir réécrit l'emploi du temps.
+     *
+     * « Il reste 45 min » se périme en une minute ; le reste ne change presque
+     * jamais. On ne relit donc les journées que si le jour a tourné ou si une
+     * synchronisation est passée — avant, chaque battement vidait le cache et
+     * la grille clignotait sur « Chargement… ».
+     */
+    fun tick() = launchCore(showBusy = false) {
+        val before = _state.value
+        val today = core.today()
+        val lastSync = core.timetable()?.lastSync
+        val dayTurned = today != before.today
+        val synced = lastSync != before.timetable?.lastSync
+
+        if (dayTurned) {
+            // Qui regardait aujourd'hui regarde encore aujourd'hui ; qui
+            // regardait un autre jour garde son jour.
+            _state.update {
+                it.copy(
+                    selectedDay = if (it.selectedDay == before.today) today else it.selectedDay,
+                    weekStart = if (it.weekStart == before.today.startOfWeek()) {
+                        today.startOfWeek()
+                    } else {
+                        it.weekStart
+                    },
+                )
+            }
+        }
+        if (dayTurned || synced) {
+            reload(_state.value.selectedDay)
+        } else {
+            _state.update {
+                it.copy(now = core.nowView(), today = today, unseenChanges = core.unseenChangeCount().toInt())
+            }
+        }
     }
 
     fun selectDay(epochDay: Long) {
@@ -237,7 +271,6 @@ class AppViewModel(
         _state.update {
             it.copy(
                 message = importSummary(name, report),
-                lastChanges = report.changes,
                 selectedDay = today,
                 weekStart = today.startOfWeek(),
             )
@@ -276,10 +309,30 @@ class AppViewModel(
             Notifications.ensureChannels(context)
             Notifications.changes(context, report.changes)
         }
-        _state.update {
-            it.copy(message = syncSummary(report), lastChanges = report.changes)
-        }
+        _state.update { it.copy(message = syncSummary(report)) }
         afterTimetableChanged(_state.value.selectedDay)
+    }
+
+    // ------------------------------------------------- historique des changements
+
+    fun loadHistory() = launchCore {
+        _state.update { it.copy(history = core.changeHistory(HISTORY_LIMIT)) }
+    }
+
+    /**
+     * L'historique a été regardé.
+     *
+     * On le marque vu en le quittant plutôt qu'en l'ouvrant : à l'ouverture, les
+     * nouveautés doivent encore se distinguer du reste.
+     */
+    fun markHistorySeen() = launchCore(showBusy = false) {
+        core.markChangesSeen()
+        _state.update {
+            it.copy(
+                unseenChanges = 0,
+                history = it.history.map { entry -> entry.copy(seen = true) },
+            )
+        }
     }
 
     fun renameTimetable(name: String) = launchCore {
@@ -294,7 +347,7 @@ class AppViewModel(
 
     fun clearTimetable() = launchCore {
         core.clearTimetable()
-        _state.update { it.copy(message = "Emploi du temps effacé.", lastChanges = emptyList()) }
+        _state.update { it.copy(message = "Emploi du temps effacé.", history = emptyList()) }
         afterTimetableChanged(_state.value.selectedDay)
     }
 
@@ -517,6 +570,7 @@ class AppViewModel(
                 today = core.today(),
                 categories = core.categories(),
                 propertyKeys = core.propertyKeys(),
+                unseenChanges = core.unseenChangeCount().toInt(),
             )
         }
     }
@@ -538,13 +592,23 @@ class AppViewModel(
         _state.value.settings?.let { SyncScheduler.apply(context, it) }
     }
 
-    /** Après une modification du contenu, le cache de jours n'est plus fiable. */
+    /**
+     * Après une modification du contenu, le cache de jours n'est plus fiable.
+     *
+     * Les journées fraîches remplacent les anciennes d'un seul geste : vider le
+     * cache d'abord laissait la grille afficher « Chargement… » le temps de la
+     * relecture.
+     */
     private suspend fun reload(around: Long) {
         loadShell()
-        invalidateDays()
-        loadAround(around)
-        loadAround(_state.value.weekStart + 3)
+        val fresh = window(around) + window(_state.value.weekStart + 3)
+        _state.update { it.copy(days = fresh) }
     }
+
+    /** Les journées autour d'un jour, lues d'un bloc. */
+    private suspend fun window(epochDay: Long): Map<Long, DayAgenda> =
+        core.days(epochDay - PRELOAD_RADIUS, (2 * PRELOAD_RADIUS + 1).toUInt())
+            .associateBy { it.epochDay }
 
     /** Une tâche ne change qu'une journée : inutile de tout relire. */
     private suspend fun reloadDay(epochDay: Long) {
@@ -558,50 +622,43 @@ class AppViewModel(
         }
     }
 
-    private fun invalidateDays() {
-        loadedFrom = Long.MAX_VALUE
-        loadedTo = Long.MIN_VALUE
-        _state.update { it.copy(days = emptyMap()) }
-    }
-
     /**
-     * Charge la fenêtre autour d'un jour, en n'appelant le cœur que pour la
-     * partie manquante : balayer jour après jour ne doit pas tout recharger.
+     * Complète la fenêtre autour d'un jour, en n'appelant le cœur que pour les
+     * journées qui manquent : balayer jour après jour ne doit pas tout relire.
+     *
+     * Le cache est la seule mémoire de ce qui est chargé — pas de bornes tenues
+     * à côté, qui pouvaient s'en écarter et, après un saut lointain, faire lire
+     * tous les mois intermédiaires.
      */
     private suspend fun loadAround(epochDay: Long) {
-        val wanted = (epochDay - PRELOAD_RADIUS)..(epochDay + PRELOAD_RADIUS)
-        val missing = when {
-            loadedFrom > loadedTo -> wanted
-            wanted.first < loadedFrom && wanted.last > loadedTo -> wanted
-            wanted.first < loadedFrom -> wanted.first until loadedFrom
-            wanted.last > loadedTo -> (loadedTo + 1)..wanted.last
-            else -> return
-        }
+        val known = _state.value.days.keys
+        val missing = ((epochDay - PRELOAD_RADIUS)..(epochDay + PRELOAD_RADIUS))
+            .filter { it !in known }
+        if (missing.isEmpty()) return
 
-        val count = (missing.last - missing.first + 1).toInt()
-        if (count <= 0) return
-        val loaded = core.days(missing.first, count.toUInt())
-
+        val first = missing.first()
+        val loaded = core.days(first, (missing.last() - first + 1).toUInt())
         _state.update { current ->
             current.copy(days = current.days + loaded.associateBy { it.epochDay })
         }
-        loadedFrom = minOf(loadedFrom, missing.first)
-        loadedTo = maxOf(loadedTo, missing.last)
     }
 
     /**
      * Toute traversée vers le cœur passe par ici : hors du fil principal, et
      * une erreur devient un message lisible plutôt qu'un plantage.
+     *
+     * `showBusy` à faux pour ce qui tourne tout seul : un battement toutes les
+     * trente secondes n'a pas à faire clignoter l'indicateur d'activité.
      */
-    private fun launchCore(block: suspend () -> Unit) {
+    private fun launchCore(showBusy: Boolean = true, block: suspend () -> Unit) {
         viewModelScope.launch {
-            _state.update { it.copy(busy = true) }
+            if (showBusy) _state.update { it.copy(busy = true) }
             try {
                 withContext(Dispatchers.IO) { block() }
             } catch (e: Exception) {
                 _state.update { it.copy(message = e.message ?: e.toString()) }
             } finally {
-                _state.update { it.copy(busy = false) }
+                if (showBusy) _state.update { it.copy(busy = false) }
             }
         }
     }

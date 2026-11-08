@@ -53,6 +53,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.timewrap.core.EventDraft
 import app.timewrap.core.EventOrigin
@@ -65,6 +68,7 @@ import app.timewrap.ui.CategoryPicker
 import app.timewrap.ui.ColorsScreen
 import app.timewrap.ui.ConflictResolutionDialog
 import app.timewrap.ui.ConflictsScreen
+import app.timewrap.ui.HistoryScreen
 import app.timewrap.ui.DayScreen
 import app.timewrap.ui.EventEditor
 import app.timewrap.ui.NowScreen
@@ -89,10 +93,14 @@ class MainActivity : ComponentActivity() {
     /** Fichier `.ics` ouvert ou partagé depuis une autre application. */
     private var pendingImport by mutableStateOf<Uri?>(null)
 
+    /** Vrai quand l'activité a été ouverte depuis une notification de changement. */
+    private var openHistory by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         pendingImport = intent.extractIcsUri()
+        openHistory = intent.wantsHistory()
         Notifications.ensureChannels(this)
 
         val core = (application as TimewrapApp).core
@@ -109,6 +117,8 @@ class MainActivity : ComponentActivity() {
                         model = model,
                         pendingImport = pendingImport,
                         onPendingHandled = { pendingImport = null },
+                        openHistory = openHistory,
+                        onHistoryOpened = { openHistory = false },
                         readIcs = ::readIcs,
                     )
                 }
@@ -120,6 +130,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         pendingImport = intent.extractIcsUri()
+        openHistory = intent.wantsHistory()
     }
 
     /** Lit le contenu d'un `.ics` et devine un nom présentable. */
@@ -142,6 +153,9 @@ private fun Intent.extractIcsUri(): Uri? = when (action) {
     else -> null
 }
 
+private fun Intent.wantsHistory(): Boolean =
+    getStringExtra(Notifications.EXTRA_OPEN) == Notifications.OPEN_HISTORY
+
 private enum class Tab(val label: String, val icon: ImageVector) {
     Now("Maintenant", Icons.Outlined.Home),
     Day("Jour", Icons.AutoMirrored.Outlined.List),
@@ -160,6 +174,7 @@ private sealed interface Overlay {
     data object Conflicts : Overlay
     data object Rules : Overlay
     data object Colors : Overlay
+    data object History : Overlay
     data class PropertyValues(val key: PropertyKey) : Overlay
     data class Editor(val draft: EventDraft) : Overlay
 }
@@ -170,6 +185,8 @@ private fun TimewrapRoot(
     model: AppViewModel,
     pendingImport: Uri?,
     onPendingHandled: () -> Unit,
+    openHistory: Boolean,
+    onHistoryOpened: () -> Unit,
     readIcs: (Uri) -> Pair<String, String>?,
 ) {
     val state by model.state.collectAsState()
@@ -202,12 +219,24 @@ private fun TimewrapRoot(
         }
     }
 
-    // « Il reste 45 min » se périme en une minute : on rafraîchit doucement,
-    // sans réveiller l'appareil ni recharger toute la base.
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(30_000)
-            model.refresh()
+    LaunchedEffect(openHistory) {
+        if (openHistory) {
+            overlay = Overlay.History
+            onHistoryOpened()
+        }
+    }
+
+    // « Il reste 45 min » se périme en une minute : on bat doucement, et
+    // seulement quand l'application est à l'écran. Le premier battement tombe
+    // au retour au premier plan — c'est lui qui voit que le jour a changé
+    // pendant la nuit, ou qu'une synchronisation est passée entre-temps.
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                model.tick()
+                delay(30_000)
+            }
         }
     }
 
@@ -259,6 +288,7 @@ private fun TimewrapRoot(
                 Tab.Now -> NowScreen(
                     state = state,
                     onImport = { tab = Tab.Settings },
+                    onOpenHistory = { overlay = Overlay.History },
                     onSelect = { detail = it },
                     onOpenTasks = { tab = Tab.Tasks },
                 )
@@ -294,6 +324,7 @@ private fun TimewrapRoot(
                     onRename = model::renameTimetable,
                     onColor = model::setTimetableColor,
                     onColors = { overlay = Overlay.Colors },
+                    onHistory = { overlay = Overlay.History },
                     onConflicts = { overlay = Overlay.Conflicts },
                     onClear = model::clearTimetable,
                 )
@@ -310,6 +341,15 @@ private fun TimewrapRoot(
                 onLoad = model::loadColors,
                 onOpenKey = { overlay = Overlay.PropertyValues(it) },
                 onRules = { overlay = Overlay.Rules },
+                onBack = { overlay = null },
+            )
+        }
+
+        Overlay.History -> Surface(Modifier.fillMaxSize()) {
+            HistoryScreen(
+                state = state,
+                onLoad = model::loadHistory,
+                onSeen = model::markHistorySeen,
                 onBack = { overlay = null },
             )
         }
